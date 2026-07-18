@@ -50,23 +50,28 @@ contract CounterTest is DSTest {
         .assert_success();
 
     let stdout = output.get_output().stdout_lossy();
-    assert!(stdout.contains(
-        "src/Counter.sol     | 100.00% (4/4)   | 100.00% (2/2) | 100.00% (0/0) | 100.00% (2/2)"
-    ));
-    assert!(stdout.contains(
-        "src/CounterTest.sol | 100.00% (6/6)   | 100.00% (4/4) | 100.00% (0/0) | 100.00% (2/2)"
-    ));
-    assert!(stdout.contains(
-        "Total               | 100.00% (10/10) | 100.00% (6/6) | 100.00% (0/0) | 100.00% (4/4)"
-    ));
+    assert!(
+        stdout.contains(
+            "src/Counter.sol | 100.00% (4/4) | 100.00% (2/2) | 100.00% (0/0) | 100.00% (2/2)"
+        ),
+        "{stdout}"
+    );
+    // Test contracts are excluded by the canonical inventory, matching bytecode coverage.
+    assert!(!stdout.contains("| src/CounterTest.sol |"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "Total           | 100.00% (4/4) | 100.00% (2/2) | 100.00% (0/0) | 100.00% (2/2)"
+        ),
+        "{stdout}"
+    );
 });
 
 forgetest!(instrumented_stack_too_deep, |prj, cmd| {
     prj.insert_ds_test();
-    // A contract that would normally fail with "Stack Too Deep" when instrumented with legacy method
-    // (if legacy method added many vars, but legacy doesn't really add vars, it just has poor source maps).
-    // Actually, "Stack Too Deep" is solved by source instrumentation because it doesn't rely on source maps
-    // which are often broken by viaIR or complex code.
+    // A contract that would normally fail with "Stack Too Deep" when instrumented with legacy
+    // method (if legacy method added many vars, but legacy doesn't really add vars, it just has
+    // poor source maps). Actually, "Stack Too Deep" is solved by source instrumentation because
+    // it doesn't rely on source maps which are often broken by viaIR or complex code.
     prj.add_source(
         "Large.sol",
         r#"

@@ -373,12 +373,6 @@ impl Cheatcode for dumpStateCall {
     }
 }
 
-impl Cheatcode for coverageHitCall {
-    fn apply(&self, _state: &mut Cheatcodes) -> Result {
-        Ok(Default::default())
-    }
-}
-
 impl Cheatcode for recordCall {
     fn apply(&self, state: &mut Cheatcodes) -> Result {
         let Self {} = self;

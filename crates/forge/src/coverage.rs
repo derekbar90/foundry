@@ -16,6 +16,7 @@ use std::{
 pub use foundry_evm::coverage::*;
 
 pub mod instrument;
+pub mod preprocessor;
 
 /// A coverage reporter.
 pub trait CoverageReporter {

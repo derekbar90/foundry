@@ -15,6 +15,36 @@ use std::{
     sync::Arc,
 };
 
+/// Describes how a canonical coverage item can be observed by source instrumentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeSiteKind {
+    /// Enter the body of a function or modifier.
+    FunctionEntry,
+    /// Enter a statement before evaluating it.
+    StatementEntry,
+    /// Evaluate an expression at its exact source range.
+    Expression,
+    /// Enter one path of a branch.
+    Branch { path_id: u32 },
+}
+
+/// A canonical source-instrumentation target.
+#[derive(Clone, Debug)]
+pub struct ProbeSite {
+    /// The canonical item ID within the analysis.
+    pub item_id: u32,
+    /// The source rewrite strategy for the item.
+    pub kind: ProbeSiteKind,
+    /// The exact source range whose execution the probe represents.
+    pub loc: SourceLocation,
+}
+
+#[derive(Clone, Debug)]
+struct AnalyzedItem {
+    item: CoverageItem,
+    probe_site: Option<ProbeSiteKind>,
+}
+
 /// A visitor that walks the AST of a single contract and finds coverage items.
 #[derive(Clone)]
 struct SourceVisitor<'gcx> {
@@ -30,7 +60,7 @@ struct SourceVisitor<'gcx> {
     branch_id: u32,
 
     /// Coverage items
-    items: Vec<CoverageItem>,
+    items: Vec<AnalyzedItem>,
 
     all_lines: Vec<u32>,
     function_calls: Vec<Span>,
@@ -79,7 +109,7 @@ impl<'gcx> SourceVisitor<'gcx> {
     /// Returns `true` if the contract has any test functions.
     fn has_tests(&self, checkpoint: &SourceVisitorCheckpoint) -> bool {
         self.items[checkpoint.items..].iter().any(|item| {
-            if let CoverageItemKind::Function { name } = &item.kind {
+            if let CoverageItemKind::Function { name } = &item.item.kind {
                 name.is_any_test()
             } else {
                 false
@@ -91,14 +121,14 @@ impl<'gcx> SourceVisitor<'gcx> {
     fn disambiguate_functions(&mut self) {
         let mut dups = HashMap::<_, Vec<usize>>::default();
         for (i, item) in self.items.iter().enumerate() {
-            if let CoverageItemKind::Function { name } = &item.kind {
+            if let CoverageItemKind::Function { name } = &item.item.kind {
                 dups.entry(name.clone()).or_default().push(i);
             }
         }
         for dups in dups.values() {
             if dups.len() > 1 {
                 for (i, &dup) in dups.iter().enumerate() {
-                    let item = &mut self.items[dup];
+                    let item = &mut self.items[dup].item;
                     if let CoverageItemKind::Function { name } = &item.kind {
                         item.kind =
                             CoverageItemKind::Function { name: format!("{name}.{i}").into() };
@@ -114,7 +144,7 @@ impl<'gcx> SourceVisitor<'gcx> {
     }
 
     fn sort(&mut self) {
-        self.items.sort();
+        self.items.sort_by(|left, right| left.item.cmp(&right.item));
     }
 
     fn push_lines(&mut self) {
@@ -123,12 +153,15 @@ impl<'gcx> SourceVisitor<'gcx> {
         let mut lines = Vec::new();
         for &line in &self.all_lines {
             if let Some(reference_item) =
-                self.items.iter().find(|item| item.loc.lines.start == line)
+                self.items.iter().find(|item| item.item.loc.lines.start == line)
             {
-                lines.push(CoverageItem {
-                    kind: CoverageItemKind::Line,
-                    loc: reference_item.loc.clone(),
-                    hits: 0,
+                lines.push(AnalyzedItem {
+                    item: CoverageItem {
+                        kind: CoverageItemKind::Line,
+                        loc: reference_item.item.loc.clone(),
+                        hits: 0,
+                    },
+                    probe_site: None,
                 });
             }
         }
@@ -136,18 +169,22 @@ impl<'gcx> SourceVisitor<'gcx> {
     }
 
     fn push_stmt(&mut self, span: Span) {
-        self.push_item_kind(CoverageItemKind::Statement, span);
+        self.push_item_kind(CoverageItemKind::Statement, span, ProbeSiteKind::StatementEntry);
+    }
+
+    fn push_expr(&mut self, span: Span) {
+        self.push_item_kind(CoverageItemKind::Statement, span, ProbeSiteKind::Expression);
     }
 
     /// Creates a coverage item for a given kind and source location. Pushes item to the internal
     /// collection (plus additional coverage line if item is a statement).
-    fn push_item_kind(&mut self, kind: CoverageItemKind, span: Span) {
+    fn push_item_kind(&mut self, kind: CoverageItemKind, span: Span, probe: ProbeSiteKind) {
         let item = CoverageItem { kind, loc: self.source_location_for(span), hits: 0 };
 
         debug_assert!(!matches!(item.kind, CoverageItemKind::Line));
         self.all_lines.push(item.loc.lines.start);
 
-        self.items.push(item);
+        self.items.push(AnalyzedItem { item, probe_site: Some(probe) });
     }
 
     fn source_location_for(&self, mut span: Span) -> SourceLocation {
@@ -224,6 +261,7 @@ impl<'ast> ast::Visit<'ast> for SourceVisitor<'_> {
                     self.push_item_kind(
                         CoverageItemKind::Function { name: name.into() },
                         item.span,
+                        ProbeSiteKind::FunctionEntry,
                     );
                 }
 
@@ -258,6 +296,7 @@ impl<'ast> ast::Visit<'ast> for SourceVisitor<'_> {
                     self.push_item_kind(
                         CoverageItemKind::Branch { branch_id, path_id: 0, is_first_opcode: true },
                         then_stmt.span,
+                        ProbeSiteKind::Branch { path_id: 0 },
                     );
                     if else_stmt.is_some() {
                         // We use `stmt.span`, which includes `else_stmt.span`, since we need to
@@ -270,6 +309,7 @@ impl<'ast> ast::Visit<'ast> for SourceVisitor<'_> {
                                 is_first_opcode: false,
                             },
                             stmt.span,
+                            ProbeSiteKind::Branch { path_id: 1 },
                         );
                     }
                 }
@@ -286,6 +326,7 @@ impl<'ast> ast::Visit<'ast> for SourceVisitor<'_> {
                         self.push_item_kind(
                             CoverageItemKind::Branch { branch_id, path_id, is_first_opcode: true },
                             span,
+                            ProbeSiteKind::Branch { path_id },
                         );
                         path_id += 1;
                     } else if !args.is_empty() {
@@ -316,7 +357,7 @@ impl<'ast> ast::Visit<'ast> for SourceVisitor<'_> {
             | ExprKind::Unary(..)
             | ExprKind::Binary(..)
             | ExprKind::Ternary(..) => {
-                self.push_stmt(expr.span);
+                self.push_expr(expr.span);
                 if matches!(expr.kind, ExprKind::Binary(..)) {
                     return self.walk_expr(expr);
                 }
@@ -337,6 +378,7 @@ impl<'ast> ast::Visit<'ast> for SourceVisitor<'_> {
                                 is_first_opcode: false,
                             },
                             expr.span,
+                            ProbeSiteKind::Branch { path_id: 0 },
                         );
                         self.push_item_kind(
                             CoverageItemKind::Branch {
@@ -345,6 +387,7 @@ impl<'ast> ast::Visit<'ast> for SourceVisitor<'_> {
                                 is_first_opcode: false,
                             },
                             expr.span,
+                            ProbeSiteKind::Branch { path_id: 1 },
                         );
                     }
                 }
@@ -373,6 +416,7 @@ impl<'ast> ast::Visit<'ast> for SourceVisitor<'_> {
                 self.push_item_kind(
                     CoverageItemKind::Branch { branch_id, path_id: 0, is_first_opcode: false },
                     stmt.span,
+                    ProbeSiteKind::Branch { path_id: 0 },
                 );
             }
             StmtKind::For(yul::StmtFor { body, .. }) => {
@@ -386,7 +430,11 @@ impl<'ast> ast::Visit<'ast> for SourceVisitor<'_> {
             }
             StmtKind::FunctionDef(func) => {
                 let name = func.name.as_str();
-                self.push_item_kind(CoverageItemKind::Function { name: name.into() }, stmt.span);
+                self.push_item_kind(
+                    CoverageItemKind::Function { name: name.into() },
+                    stmt.span,
+                    ProbeSiteKind::FunctionEntry,
+                );
             }
             // TODO(dani): merge with Block below on next solar release: https://github.com/paradigmxyz/solar/pull/496
             StmtKind::Expr(_) => {
@@ -421,7 +469,7 @@ impl<'gcx> hir::Visit<'gcx> for SourceVisitor<'gcx> {
             && self.function_calls_set.contains(&expr.span)
             && is_regular_call(lhs)
         {
-            self.push_stmt(expr.span);
+            self.push_expr(expr.span);
         }
         self.walk_expr(expr)
     }
@@ -456,6 +504,8 @@ fn stmt_has_statements(stmt: &ast::Stmt<'_>) -> bool {
 pub struct SourceAnalysis {
     /// All the coverage items.
     all_items: Vec<CoverageItem>,
+    /// Source-instrumentation strategy aligned with `all_items`.
+    probe_site_kinds: Vec<Option<ProbeSiteKind>>,
     /// Source ID to `(offset, len)` into `all_items`.
     map: Vec<(u32, u32)>,
 }
@@ -476,17 +526,25 @@ impl SourceAnalysis {
     /// not taken into account.
     #[instrument(name = "SourceAnalysis::new", skip_all)]
     pub fn new(data: &SourceFiles, output: &ProjectCompileOutput) -> eyre::Result<Self> {
-        let mut sourced_items = output.parser().solc().compiler().enter(|compiler| {
+        Ok(output.parser().solc().compiler().enter(|compiler| Self::from_gcx(data, compiler.gcx())))
+    }
+
+    /// Builds the canonical inventory from an already parsed and lowered semantic context.
+    ///
+    /// This is used by resolved-input preprocessors that must capture original-source semantics
+    /// before a backend rewrites the compiler input.
+    pub fn from_gcx(data: &SourceFiles, gcx: Gcx<'_>) -> Self {
+        let mut sourced_items = {
             data.sources
                 .par_iter()
                 .map(|(&source_id, path)| {
                     let _guard = debug_span!("SourceAnalysis::new::visit", ?path).entered();
 
-                    let (_, source) = compiler.gcx().get_ast_source(path).unwrap();
+                    let (_, source) = gcx.get_ast_source(path).unwrap();
                     let ast = source.ast.as_ref().unwrap();
-                    let (hir_source_id, _) = compiler.gcx().get_hir_source(path).unwrap();
+                    let (hir_source_id, _) = gcx.get_hir_source(path).unwrap();
 
-                    let mut visitor = SourceVisitor::new(source_id, compiler.gcx());
+                    let mut visitor = SourceVisitor::new(source_id, gcx);
                     for item in ast.items.iter() {
                         // Visit only top-level contracts.
                         let ItemKind::Contract(contract) = &item.kind else { continue };
@@ -515,14 +573,16 @@ impl SourceAnalysis {
                     }
                     (source_id, visitor.items)
                 })
-                .collect::<Vec<(u32, Vec<CoverageItem>)>>()
-        });
+                .collect::<Vec<(u32, Vec<AnalyzedItem>)>>()
+        };
 
         // Create mapping and merge items.
-        sourced_items.sort_by_key(|(id, items)| (*id, items.first().map(|i| i.loc.bytes.start)));
-        let Some(&(max_idx, _)) = sourced_items.last() else { return Ok(Self::default()) };
+        sourced_items
+            .sort_by_key(|(id, items)| (*id, items.first().map(|item| item.item.loc.bytes.start)));
+        let Some(&(max_idx, _)) = sourced_items.last() else { return Self::default() };
         let len = max_idx + 1;
         let mut all_items = Vec::new();
+        let mut probe_site_kinds = Vec::new();
         let mut map = vec![(u32::MAX, 0); len as usize];
         for (idx, items) in sourced_items {
             // Assumes that all `idx` items are consecutive, guaranteed by the sort above.
@@ -531,10 +591,13 @@ impl SourceAnalysis {
                 map[idx].0 = all_items.len() as u32;
             }
             map[idx].1 += items.len() as u32;
-            all_items.extend(items);
+            for item in items {
+                all_items.push(item.item);
+                probe_site_kinds.push(item.probe_site);
+            }
         }
 
-        Ok(Self { all_items, map })
+        Self { all_items, probe_site_kinds, map }
     }
 
     /// Returns all the coverage items.
@@ -563,6 +626,20 @@ impl SourceAnalysis {
             offset = 0;
         }
         (offset, &self.all_items[offset as usize..][..len as usize])
+    }
+
+    /// Returns the canonical source-instrumentation sites for a source.
+    pub fn probe_sites_for_source(&self, source_id: u32) -> Vec<ProbeSite> {
+        let (base_id, items) = self.items_for_source(source_id);
+        items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let item_id = base_id + index as u32;
+                let kind = self.probe_site_kinds.get(item_id as usize).copied().flatten()?;
+                Some(ProbeSite { item_id, kind, loc: item.loc.clone() })
+            })
+            .collect()
     }
 
     /// Returns the coverage item for the given item ID.
@@ -612,7 +689,25 @@ impl SourceAnalysis {
             final_items.append(&mut lines);
         }
 
-        Self { all_items: final_items, map }
+        let probe_site_kinds = vec![None; final_items.len()];
+        Self { all_items: final_items, probe_site_kinds, map }
+    }
+
+    /// Retains canonical items and their aligned probe metadata.
+    pub fn retain_items(&mut self, mut predicate: impl FnMut(&CoverageItem) -> bool) {
+        let mut retained_items = Vec::with_capacity(self.all_items.len());
+        let mut retained_sites = Vec::with_capacity(self.probe_site_kinds.len());
+        for (item, site) in std::mem::take(&mut self.all_items)
+            .into_iter()
+            .zip(std::mem::take(&mut self.probe_site_kinds))
+        {
+            if predicate(&item) {
+                retained_items.push(item);
+                retained_sites.push(site);
+            }
+        }
+        self.all_items = retained_items;
+        self.probe_site_kinds = retained_sites;
     }
 }
 

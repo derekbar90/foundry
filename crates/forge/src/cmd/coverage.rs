@@ -1,9 +1,10 @@
 use super::{install, test::TestArgs, watch::WatchArgs};
 use crate::coverage::{
     BytecodeReporter, ContractId, CoverageReport, CoverageReporter, CoverageSummaryReporter,
-    DebugReporter, ItemAnchor, LcovReporter,
+    DebugReporter, ItemAnchor, LcovReporter, ProbeTarget,
     analysis::{SourceAnalysis, SourceFiles},
     anchors::find_anchors,
+    preprocessor::{SourceCoverageOptions, SourceCoveragePreprocessor},
 };
 use alloy_primitives::{Address, Bytes, U256, map::HashMap};
 use clap::{Parser, ValueEnum, ValueHint};
@@ -15,7 +16,7 @@ use foundry_compilers::{
     artifacts::{CompactBytecode, CompactDeployedBytecode, sourcemap::SourceMap},
 };
 use foundry_config::Config;
-use foundry_evm::{core::ic::IcPcMap, opts::EvmOpts};
+use foundry_evm::{core::ic::IcPcMap, coverage::CoverageMode, opts::EvmOpts};
 use rayon::prelude::*;
 use semver::{Version, VersionReq};
 use std::path::{Path, PathBuf};
@@ -72,6 +73,10 @@ pub struct CoverageArgs {
     #[arg(long, help_heading = "Experimental")]
     instrument_source: bool,
 
+    /// Accept a source report when selected legacy or non-Solidity inputs are unsupported.
+    #[arg(long, requires = "instrument_source", help_heading = "Experimental")]
+    allow_partial: bool,
+
     /// The coverage reporters to use. Constructed from the other fields.
     #[arg(skip)]
     reporters: Vec<Box<dyn CoverageReporter>>,
@@ -84,10 +89,6 @@ impl CoverageArgs {
     pub async fn run(mut self) -> Result<()> {
         let (mut config, evm_opts) = self.load_config_and_evm_opts()?;
 
-        if self.instrument_source {
-            return self.run_instrumented(config, evm_opts).await;
-        }
-
         // install missing dependencies
         if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
         {
@@ -97,6 +98,10 @@ impl CoverageArgs {
 
         // Set fuzz seed so coverage reports are deterministic
         config.fuzz.seed = Some(U256::from_be_bytes(STATIC_FUZZ_SEED));
+
+        if self.instrument_source {
+            return self.run_instrumented(config, evm_opts).await;
+        }
 
         let (paths, mut output) = {
             let (project, output) = self.build(&config)?;
@@ -112,103 +117,86 @@ impl CoverageArgs {
         self.collect(&paths.root, &output, report, config, evm_opts).await
     }
 
-    /// Experimental source instrumentation mode.
-    async fn run_instrumented(mut self, mut config: Config, evm_opts: EvmOpts) -> Result<()> {
+    /// Instruments each resolved Solidity compiler input while retaining the original runtime
+    /// project root and filesystem configuration.
+    async fn run_instrumented(mut self, config: Config, evm_opts: EvmOpts) -> Result<()> {
         sh_println!("Experimental source instrumentation mode enabled.")?;
 
-        // 1. Setup temp directory
-        let temp_dir = tempfile::tempdir()?;
-        let temp_root = temp_dir.path();
+        let filter = self.test.filter(&config)?;
+        let options = SourceCoverageOptions {
+            include_libs: self.include_libs,
+            exclude_tests: self.exclude_tests,
+            coverage_pattern_inverse: filter.args().coverage_pattern_inverse.clone(),
+        };
+        let (preprocessor, state) = SourceCoveragePreprocessor::new(options);
+        let (project, output) = self.build_instrumented(&config, preprocessor)?;
+        let state = state.lock().unwrap().clone();
 
-        // 2. Collect and instrument sources
-        let mut coverage_items = Vec::new();
-        let sess = solar::interface::Session::builder().with_stderr_emitter().build();
-
-        let project = config.project()?;
-        let source_paths = project.paths.input_files();
-
-        let mut path_to_id: HashMap<PathBuf, usize> = HashMap::default();
-        sess.enter_sequential(|| {
-            for (id, path) in source_paths.iter().enumerate() {
-                let rel_path = path.strip_prefix(&config.root)?;
-                let target_path = temp_root.join(rel_path);
-                if let Some(parent) = target_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-
-                let content = std::fs::read_to_string(path)?;
-                let mut instrumented_content = content.clone();
-
-                let arena = solar::ast::Arena::new();
-                let mut parser = solar::parse::Parser::from_source_code(
-                    &sess,
-                    &arena,
-                    solar::interface::source_map::FileName::Real(path.clone()),
-                    content,
-                )
-                .map_err(|e| {
-                    eyre::eyre!("Failed to create parser for {:?}: {:?}", path, e)
-                })?;
-
-                match parser.parse_file() {
-                    Ok(ast) => {
-                        let mut instrumenter =
-                            crate::coverage::instrument::Instrumenter::new(&sess, id as u32);
-                        let _ =
-                            solar::ast::visit::Visit::visit_source_unit(&mut instrumenter, &ast);
-                        instrumenter.instrument(&mut instrumented_content);
-                        coverage_items.extend(instrumenter.items);
-                    }
-                    Err(err) => {
-                        sh_warn!("Failed to parse {:?}: {:?}", path, err)?;
-                    }
-                }
-
-                instrumented_content.push_str(&format!(
-                    "\n\ninterface VmCoverage_{} {{ function coverageHit(uint256,uint256) external pure; }}",
-                    id
-                ));
-                std::fs::write(&target_path, instrumented_content)
-                    .map_err(|e| eyre::eyre!("Failed to write instrumented file to {:?}: {}", target_path, e))?;
-                path_to_id.insert(path.clone(), id);
-            }
-            Ok::<(), eyre::Error>(())
-        })?;
-
-        // 3. Update config to point to temp root
-        let original_root = config.root.clone();
-        config.root = temp_root.to_path_buf();
-        config.src = temp_root.join(config.src.strip_prefix(&original_root)?);
-        config.test = temp_root.join(config.test.strip_prefix(&original_root)?);
-        config.script = temp_root.join(config.script.strip_prefix(&original_root)?);
-
-        // 4. Build instrumented project
-        let (_project, output) = self.build(&config)?;
-
-        // 5. Prepare Report
-        let mut report = CoverageReport::default();
-        let version = output
-            .output()
-            .sources
-            .sources_with_version()
-            .next()
-            .map(|(_, _, v)| v.clone())
-            .unwrap_or_else(|| Version::new(0, 8, 0));
-
-        for (path, &id) in &path_to_id {
-            let rel_path = path.strip_prefix(&original_root).unwrap_or(path);
-            report.add_source(version.clone(), id, rel_path.to_path_buf());
+        if let Some(error) = state.fatal_error {
+            eyre::bail!(error);
+        }
+        if !state.completeness.is_complete() && !self.allow_partial {
+            let details = state
+                .completeness
+                .reasons()
+                .iter()
+                .map(|reason| match &reason.path {
+                    Some(path) => format!("{}: {}", path.display(), reason.detail),
+                    None => reason.detail.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n  - ");
+            eyre::bail!(
+                "source coverage is incomplete; rerun with --allow-partial to accept:\n  - {details}"
+            );
+        }
+        if !state.completeness.is_complete()
+            && self
+                .report
+                .iter()
+                .any(|kind| matches!(kind, CoverageReportKind::Lcov | CoverageReportKind::Bytecode))
+        {
+            eyre::bail!(
+                "LCOV and bytecode reporters cannot represent partial source coverage; use \
+                 --report summary or --report debug"
+            );
         }
 
-        let analysis = SourceAnalysis::from_items(coverage_items);
-        report.add_analysis(version, analysis);
+        let mut report = CoverageReport::default();
+        report.completeness = state.completeness;
+        let mut by_version: HashMap<Version, Vec<_>> = HashMap::default();
+        for source in &state.sources {
+            let path = source.path.strip_prefix(&project.paths.root).unwrap_or(&source.path);
+            report.add_source(
+                source.version.clone(),
+                source.source_id as usize,
+                path.to_path_buf(),
+            );
+            by_version.entry(source.version.clone()).or_default().push(source.clone());
+        }
 
-        self.populate_reporters(&original_root);
+        for (version, sources) in by_version {
+            let analysis = SourceAnalysis::from_items(
+                sources.iter().flat_map(|source| source.items.clone()).collect(),
+            );
+            for source in sources {
+                let (base_id, items) = analysis.items_for_source(source.source_id);
+                for (probe, local_id) in source.probes {
+                    if local_id as usize >= items.len() {
+                        continue;
+                    }
+                    report.register_probe(
+                        probe,
+                        ProbeTarget { version: version.clone(), item_id: base_id + local_id },
+                    );
+                }
+            }
+            report.add_analysis(version, analysis);
+        }
 
+        self.populate_reporters(&project.paths.root);
         sh_println!("Running tests...")?;
-        self.collect(&original_root, &output, report, config, evm_opts).await?;
-
-        Ok(())
+        self.collect(&project.paths.root, &output, report, config, evm_opts).await
     }
 
     fn populate_reporters(&mut self, root: &Path) {
@@ -237,41 +225,58 @@ impl CoverageArgs {
     fn build(&self, config: &Config) -> Result<(Project, ProjectCompileOutput)> {
         let mut project = config.ephemeral_project()?;
 
-        // If `via_ir` is enabled in the config, we should use `ir_minimum` to avoid stack too deep
-        // errors and because disabling it might break compilation.
-        let use_ir_minimum = self.ir_minimum || config.via_ir;
+        if !self.instrument_source || self.ir_minimum {
+            // If `via_ir` is enabled in the config, we should use `ir_minimum` to avoid stack too
+            // deep errors and because disabling it might break compilation.
+            let use_ir_minimum = self.ir_minimum || config.via_ir;
 
-        if use_ir_minimum {
-            if !self.ir_minimum && config.via_ir {
-                sh_warn!(
-                    "Enabling `--ir-minimum` automatically because `via_ir` is enabled in configuration.\n\
-                     This enables `viaIR` with minimum optimization, which can result in inaccurate source mappings.\n\
-                     See more: https://book.getfoundry.sh/guides/best-practices/stack-too-deep"
-                )?;
+            if use_ir_minimum {
+                if !self.ir_minimum && config.via_ir {
+                    sh_warn!(
+                        "Enabling `--ir-minimum` automatically because `via_ir` is enabled in configuration.\n\
+                         This enables `viaIR` with minimum optimization, which can result in inaccurate source mappings.\n\
+                         See more: https://book.getfoundry.sh/guides/best-practices/stack-too-deep"
+                    )?;
+                } else {
+                    sh_warn!(
+                        "`--ir-minimum` enables `viaIR` with minimum optimization, \
+                         which can result in inaccurate source mappings.\n\
+                         Only use this flag as a workaround if you are experiencing \"stack too deep\" errors.\n\
+                         Note that `viaIR` is production ready since Solidity 0.8.13 and above.\n\
+                         See more: https://book.getfoundry.sh/guides/best-practices/stack-too-deep"
+                    )?;
+                }
             } else {
                 sh_warn!(
-                    "`--ir-minimum` enables `viaIR` with minimum optimization, \
-                     which can result in inaccurate source mappings.\n\
-                     Only use this flag as a workaround if you are experiencing \"stack too deep\" errors.\n\
-                     Note that `viaIR` is production ready since Solidity 0.8.13 and above.\n\
+                    "optimizer settings and `viaIR` have been disabled for accurate coverage reports.\n\
+                     If you encounter \"stack too deep\" errors, consider using `--ir-minimum` which \
+                     enables `viaIR` with minimum optimization resolving most of the errors.\n\
                      See more: https://book.getfoundry.sh/guides/best-practices/stack-too-deep"
                 )?;
             }
-        } else {
-            sh_warn!(
-                "optimizer settings and `viaIR` have been disabled for accurate coverage reports.\n\
-                 If you encounter \"stack too deep\" errors, consider using `--ir-minimum` which \
-                 enables `viaIR` with minimum optimization resolving most of the errors.\n\
-                 See more: https://book.getfoundry.sh/guides/best-practices/stack-too-deep"
-            )?;
-        }
 
-        config.disable_optimizations(&mut project, use_ir_minimum);
+            config.disable_optimizations(&mut project, use_ir_minimum);
+        }
 
         let output = ProjectCompiler::default()
             .compile(&project)?
             .with_stripped_file_prefixes(project.root());
 
+        Ok((project, output))
+    }
+
+    fn build_instrumented(
+        &self,
+        config: &Config,
+        preprocessor: SourceCoveragePreprocessor,
+    ) -> Result<(Project, ProjectCompileOutput)> {
+        let mut project = config.ephemeral_project()?;
+        if self.ir_minimum || config.via_ir {
+            config.disable_optimizations(&mut project, true);
+        }
+        let output = ProjectCompiler::default()
+            .compile_with_preprocessor(&project, preprocessor)?
+            .with_stripped_file_prefixes(project.root());
         Ok((project, output))
     }
 
@@ -375,8 +380,7 @@ impl CoverageArgs {
                 evm_opts,
                 output,
                 &filter,
-                !self.instrument_source,
-                self.instrument_source,
+                if self.instrument_source { CoverageMode::Source } else { CoverageMode::Bytecode },
             )
             .await?;
 
@@ -447,6 +451,19 @@ impl CoverageArgs {
 
     #[instrument(name = "Coverage::report", skip_all)]
     fn report(&mut self, report: &CoverageReport) -> Result<()> {
+        if !report.completeness.is_complete() {
+            sh_warn!(
+                "source coverage is partial: {} selected input(s) were not instrumented",
+                report.completeness.reasons().len()
+            )?;
+            for reason in report.completeness.reasons() {
+                if let Some(path) = &reason.path {
+                    sh_warn!("{}: {}", path.display(), reason.detail)?;
+                } else {
+                    sh_warn!("{}", reason.detail)?;
+                }
+            }
+        }
         for reporter in &mut self.reporters {
             let _guard = debug_span!("reporter.report", kind=%reporter.name()).entered();
             reporter.report(report)?;

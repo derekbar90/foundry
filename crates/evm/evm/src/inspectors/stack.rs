@@ -864,7 +864,6 @@ impl InspectorStackRefMut<'_> {
                 &mut self.edge_coverage,
                 &mut self.fuzzer,
                 &mut self.line_coverage,
-                &mut self.source_coverage,
                 &mut self.printer,
                 &mut self.revert_diag,
                 &mut self.script_execution_inspector,
@@ -906,7 +905,6 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStackRefMut<'_>
         call_inspectors!(
             [
                 &mut self.line_coverage,
-                &mut self.source_coverage,
                 &mut self.tracer,
                 &mut self.cheatcodes,
                 &mut self.script_execution_inspector,

@@ -1,10 +1,10 @@
-use foundry_test_utils::{
-    forgetest,
-    util::OutputExt,
-};
+use foundry_config::fs_permissions::PathPermission;
+use foundry_test_utils::{forgetest, util::OutputExt};
 
 forgetest!(instrumented_complex_control_flow, |prj, cmd| {
     prj.insert_ds_test();
+    prj.create_file("runtime-marker.txt", "original-project-root");
+    prj.update_config(|config| config.fs_permissions.add(PathPermission::read(".")));
     prj.add_source(
         "Complex.sol",
         r#"
@@ -48,7 +48,13 @@ contract Complex {
 import "./test.sol";
 import {Complex} from "./Complex.sol";
 
+interface Vm {
+    function projectRoot() external view returns (string memory);
+    function readFile(string calldata) external view returns (string memory);
+}
+
 contract ComplexTest is DSTest {
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
     Complex public complex;
 
     function setUp() public {
@@ -64,14 +70,213 @@ contract ComplexTest is DSTest {
     function test_Loops() public {
         complex.loops(5);
     }
+
+    function test_OriginalProjectRoot() public {
+        string memory marker = vm.readFile(string.concat(vm.projectRoot(), "/runtime-marker.txt"));
+        require(keccak256(bytes(marker)) == keccak256(bytes("original-project-root")));
+    }
 }
     "#,
     );
 
-    let output = cmd.arg("coverage")
-        .arg("--instrument-source")
-        .assert_success();
-    
+    let output = cmd.arg("coverage").arg("--instrument-source").assert_success();
+
     let stdout = output.get_output().stdout_lossy();
     assert!(stdout.contains("src/Complex.sol"));
+});
+
+forgetest!(instrumented_table_tests_merge_source_hits, |prj, cmd| {
+    prj.insert_ds_test();
+    prj.add_source(
+        "TableTarget.sol",
+        r#"
+contract TableTarget {
+    uint256 public value;
+    function set(uint256 next) external { value = next; }
+}
+"#,
+    );
+    prj.add_source(
+        "TableTargetTest.sol",
+        r#"
+import "./test.sol";
+import {TableTarget} from "./TableTarget.sol";
+
+contract TableTargetTest is DSTest {
+    TableTarget target = new TableTarget();
+    uint256[] public fixtureAmount = [1, 2, 3];
+    function tableSet(uint256 amount) public { target.set(amount); }
+}
+"#,
+    );
+
+    let output = cmd.arg("coverage").arg("--instrument-source").assert_success();
+    let stdout = output.get_output().stdout_lossy();
+    assert!(stdout.contains("src/TableTarget.sol") && stdout.contains("100.00% (1/1)"), "{stdout}");
+});
+
+forgetest!(instrumented_short_circuit_keeps_skipped_call_uncovered, |prj, cmd| {
+    prj.insert_ds_test();
+    prj.add_source(
+        "ShortCircuit.sol",
+        r#"
+contract ShortCircuit {
+    uint256 public calls;
+
+    function side() internal returns (bool) {
+        calls++;
+        return true;
+    }
+
+    function run(bool enabled) external returns (bool) {
+        return enabled && side();
+    }
+}
+"#,
+    );
+    prj.add_source(
+        "ShortCircuitTest.sol",
+        r#"
+import "./test.sol";
+import {ShortCircuit} from "./ShortCircuit.sol";
+contract ShortCircuitTest is DSTest {
+    function testSkippedCall() public {
+        ShortCircuit target = new ShortCircuit();
+        require(!target.run(false));
+        require(target.calls() == 0);
+    }
+}
+"#,
+    );
+
+    let output =
+        cmd.args(["coverage", "--instrument-source", "--report", "debug"]).assert_success();
+    let stdout = output.get_output().stdout_lossy();
+    let side = stdout
+        .lines()
+        .find(|line| line.ends_with("-> \"side()\""))
+        .unwrap_or_else(|| panic!("missing canonical side() item:\n{stdout}"));
+    assert!(side.contains("hits: 0"), "skipped side() was reported covered: {side}");
+});
+
+forgetest!(instrumented_void_and_tuple_for_updates_preserve_control_flow, |prj, cmd| {
+    prj.insert_ds_test();
+    prj.add_source(
+        "LoopUpdates.sol",
+        r#"
+contract LoopUpdates {
+    uint256 public ticks;
+
+    function tick() internal { ticks++; }
+    function pair() internal returns (uint256, uint256) {
+        ticks++;
+        return (1, 2);
+    }
+
+    function run() external {
+        uint256 i;
+        for (i = 0; i < 4; tick()) {
+            i++;
+            if (i == 1) continue;
+            if (i == 3) break;
+        }
+        for (uint256 j; j < 2; pair()) {
+            j++;
+        }
+    }
+}
+"#,
+    );
+    prj.add_source(
+        "LoopUpdatesTest.sol",
+        r#"
+import "./test.sol";
+import {LoopUpdates} from "./LoopUpdates.sol";
+contract LoopUpdatesTest is DSTest {
+    function testUpdates() public {
+        LoopUpdates target = new LoopUpdates();
+        target.run();
+        require(target.ticks() == 4);
+    }
+}
+"#,
+    );
+
+    cmd.args(["coverage", "--instrument-source"]).assert_success();
+});
+
+forgetest!(instrumented_typed_empty_catch_is_complete, |prj, cmd| {
+    prj.insert_ds_test();
+    prj.add_source(
+        "TypedCatch.sol",
+        r#"
+contract TypedCatch {
+    error Failed();
+    function fail() external pure { revert Failed(); }
+    function run() external {
+        try this.fail() {} catch (bytes memory reason) {}
+    }
+}
+"#,
+    );
+    prj.add_source(
+        "TypedCatchTest.sol",
+        r#"
+import "./test.sol";
+import {TypedCatch} from "./TypedCatch.sol";
+contract TypedCatchTest is DSTest {
+    function testCatch() public { new TypedCatch().run(); }
+}
+"#,
+    );
+
+    cmd.args(["coverage", "--instrument-source"]).assert_success();
+});
+
+forgetest!(instrumented_assembly_requires_partial_opt_in, |prj, cmd| {
+    prj.insert_ds_test();
+    prj.add_source(
+        "AssemblyTarget.sol",
+        r#"
+contract AssemblyTarget {
+    function value() external pure returns (uint256 result) {
+        assembly { result := 1 }
+    }
+}
+"#,
+    );
+    prj.add_source(
+        "AssemblyTargetTest.sol",
+        r#"
+import "./test.sol";
+import {AssemblyTarget} from "./AssemblyTarget.sol";
+contract AssemblyTargetTest is DSTest {
+    function testValue() public { require(new AssemblyTarget().value() == 1); }
+}
+"#,
+    );
+
+    let output = cmd.args(["coverage", "--instrument-source"]).assert_failure();
+    let stderr = output.get_output().stderr_lossy();
+    assert!(
+        stderr.contains("source coverage is incomplete") && stderr.contains("--allow-partial"),
+        "{stderr}"
+    );
+    let output = cmd
+        .forge_fuse()
+        .args(["coverage", "--instrument-source", "--allow-partial", "--report", "lcov"])
+        .assert_failure();
+    let stderr = output.get_output().stderr_lossy();
+    assert!(stderr.contains("cannot represent partial source coverage"), "{stderr}");
+    assert!(!prj.root().join("lcov.info").exists());
+
+    let output = cmd
+        .forge_fuse()
+        .args(["coverage", "--instrument-source", "--allow-partial", "--report", "bytecode"])
+        .assert_failure();
+    let stderr = output.get_output().stderr_lossy();
+    assert!(stderr.contains("cannot represent partial source coverage"), "{stderr}");
+    assert!(!prj.root().join("bytecode-coverage").exists());
+
+    cmd.forge_fuse().args(["coverage", "--instrument-source", "--allow-partial"]).assert_success();
 });

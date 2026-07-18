@@ -20,6 +20,7 @@ use foundry_config::{Config, InlineConfig};
 use foundry_evm::{
     Env,
     backend::Backend,
+    coverage::CoverageMode,
     decode::RevertDecoder,
     executors::{EarlyExit, Executor, ExecutorBuilder},
     fork::CreateFork,
@@ -300,10 +301,8 @@ pub struct TestRunnerConfig {
     /// The address which will be used to deploy the initial contracts and send all transactions.
     pub sender: Address,
 
-    /// Whether to collect line coverage info
-    pub line_coverage: bool,
-    /// Whether to collect source coverage info
-    pub source_coverage: bool,
+    /// Coverage collection backend.
+    pub coverage_mode: CoverageMode,
     /// Whether to collect debug info
     pub debug: bool,
     /// Whether to enable steps tracking in the tracer.
@@ -351,8 +350,8 @@ impl TestRunnerConfig {
                 Arc::new(cheatcodes.config.clone_with(&self.config, self.evm_opts.clone()));
         }
         inspector.tracing(self.trace_mode());
-        inspector.collect_line_coverage(self.line_coverage);
-        inspector.collect_source_coverage(self.source_coverage);
+        inspector.collect_line_coverage(self.coverage_mode == CoverageMode::Bytecode);
+        inspector.collect_source_coverage(self.coverage_mode == CoverageMode::Source);
         inspector.enable_isolation(self.isolation);
         inspector.networks(self.networks);
         // inspector.set_create2_deployer(self.evm_opts.create2_deployer);
@@ -382,8 +381,8 @@ impl TestRunnerConfig {
                 stack
                     .cheatcodes(cheats_config)
                     .trace_mode(self.trace_mode())
-                    .line_coverage(self.line_coverage)
-                    .source_coverage(self.source_coverage)
+                    .line_coverage(self.coverage_mode == CoverageMode::Bytecode)
+                    .source_coverage(self.coverage_mode == CoverageMode::Source)
                     .enable_isolation(self.isolation)
                     .networks(self.networks)
                     .create2_deployer(self.evm_opts.create2_deployer)
@@ -419,10 +418,8 @@ pub struct MultiContractRunnerBuilder {
     pub fork: Option<CreateFork>,
     /// Project config.
     pub config: Arc<Config>,
-    /// Whether or not to collect line coverage info
-    pub line_coverage: bool,
-    /// Whether or not to collect source coverage info
-    pub source_coverage: bool,
+    /// Coverage collection backend.
+    pub coverage_mode: CoverageMode,
     /// Whether or not to collect debug info
     pub debug: bool,
     /// Whether to enable steps tracking in the tracer.
@@ -443,8 +440,7 @@ impl MultiContractRunnerBuilder {
             initial_balance: Default::default(),
             evm_spec: Default::default(),
             fork: Default::default(),
-            line_coverage: Default::default(),
-            source_coverage: Default::default(),
+            coverage_mode: Default::default(),
             debug: Default::default(),
             isolation: Default::default(),
             decode_internal: Default::default(),
@@ -473,13 +469,8 @@ impl MultiContractRunnerBuilder {
         self
     }
 
-    pub fn set_coverage(mut self, enable: bool) -> Self {
-        self.line_coverage = enable;
-        self
-    }
-
-    pub fn set_source_coverage(mut self, enable: bool) -> Self {
-        self.source_coverage = enable;
+    pub fn coverage_mode(mut self, mode: CoverageMode) -> Self {
+        self.coverage_mode = mode;
         self
     }
 
@@ -615,8 +606,7 @@ impl MultiContractRunnerBuilder {
                 env,
                 spec_id: self.evm_spec.unwrap_or_else(|| self.config.evm_spec_id()),
                 sender: self.sender.unwrap_or(self.config.sender),
-                line_coverage: self.line_coverage,
-                source_coverage: self.source_coverage,
+                coverage_mode: self.coverage_mode,
                 debug: self.debug,
                 decode_internal: self.decode_internal,
                 inline_config: Arc::new(InlineConfig::new_parsed(output, &self.config)?),

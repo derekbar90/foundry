@@ -27,6 +27,27 @@ use std::{
 
 pub mod analysis;
 pub mod anchors;
+mod completeness;
+pub use completeness::{CoverageCompleteness, IncompleteReason, IncompleteReasonKind};
+
+pub mod probe;
+pub use probe::{ItemId, ProbeId, ProbeOutcome, SourceKey};
+
+/// Selects the single coverage collection backend installed in an executor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CoverageMode {
+    #[default]
+    None,
+    Bytecode,
+    Source,
+}
+
+/// An inventory item targeted by a runtime probe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeTarget {
+    pub version: Version,
+    pub item_id: u32,
+}
 
 mod inspector;
 pub use inspector::LineCoverageCollector;
@@ -54,6 +75,10 @@ pub struct CoverageReport {
     pub bytecode_hits: HashMap<ContractId, HitMap>,
     /// The bytecode -> source mappings.
     pub source_maps: HashMap<ContractId, (SourceMap, SourceMap)>,
+    /// Runtime probe IDs mapped to canonical inventory items.
+    pub probe_registry: HashMap<ProbeId, Vec<ProbeTarget>>,
+    /// Whether every selected source and item was supported by the collection backend.
+    pub completeness: CoverageCompleteness,
 }
 
 impl CoverageReport {
@@ -79,6 +104,11 @@ impl CoverageReport {
     /// Add a [`SourceAnalysis`] to this report.
     pub fn add_analysis(&mut self, version: Version, analysis: SourceAnalysis) {
         self.analyses.insert(version, analysis);
+    }
+
+    /// Registers a runtime probe target.
+    pub fn register_probe(&mut self, probe: ProbeId, target: ProbeTarget) {
+        self.probe_registry.entry(probe).or_default().push(target);
     }
 
     /// Add anchors to this report.
@@ -151,19 +181,19 @@ impl CoverageReport {
     }
 
     /// Processes data from a [`SourceHitMaps`] and sets hit counts for coverage items.
-    pub fn add_source_hit_maps(&mut self, source_hits: &SourceHitMaps) -> Result<()> {
-        for (&source_id, hit_map) in &source_hits.0 {
-            for (item_id, hits) in hit_map.iter() {
-                // Since source_id is per-compilation, we look through all analyses to find
-                // the matching version.
-                for analysis in self.analyses.values_mut() {
-                    let (base_id, items) = analysis.items_for_source(source_id as u32);
-                    if !items.is_empty()
-                        && let Some(item) =
-                            analysis.all_items_mut().get_mut((base_id + item_id) as usize)
-                    {
-                        item.hits += hits;
-                    }
+    pub fn add_source_hit_maps(&mut self, source_hits: &CoverageHits) -> Result<()> {
+        for (&probe, &hits) in &source_hits.0 {
+            let Some(targets) = self.probe_registry.get(&probe) else {
+                trace!(?probe, "ignoring an unknown source-coverage probe");
+                continue;
+            };
+            for target in targets {
+                if let Some(item) = self
+                    .analyses
+                    .get_mut(&target.version)
+                    .and_then(|analysis| analysis.all_items_mut().get_mut(target.item_id as usize))
+                {
+                    item.hits = item.hits.saturating_add(hits);
                 }
             }
         }
@@ -195,7 +225,7 @@ impl CoverageReport {
     /// will be missing the ones that are dependent on them.
     pub fn retain_sources(&mut self, mut predicate: impl FnMut(&Path) -> bool) {
         self.analyses.retain(|version, analysis| {
-            analysis.all_items_mut().retain(|item| {
+            analysis.retain_items(|item| {
                 self.source_paths
                     .get(&(version.clone(), item.loc.source_id))
                     .map(|path| predicate(path))
@@ -249,12 +279,12 @@ impl DerefMut for HitMaps {
     }
 }
 
-/// A collection of source-level hit maps, keyed by source ID.
+/// Source-level runtime probe hits.
 #[derive(Clone, Debug, Default)]
-pub struct SourceHitMaps(pub HashMap<usize, HitMap>);
+pub struct CoverageHits(pub HashMap<ProbeId, u32>);
 
-impl SourceHitMaps {
-    /// Merges two `Option<SourceHitMaps>`.
+impl CoverageHits {
+    /// Merges two optional coverage-hit collections.
     pub fn merge_opt(a: &mut Option<Self>, b: Option<Self>) {
         match (a, b) {
             (_, None) => {}
@@ -263,33 +293,44 @@ impl SourceHitMaps {
         }
     }
 
-    /// Merges two `SourceHitMaps`.
+    /// Merges two coverage-hit collections.
     pub fn merge(&mut self, other: Self) {
-        for (source_id, other_map) in other.0 {
-            self.0.entry(source_id).and_modify(|m| m.merge(&other_map)).or_insert(other_map);
+        for (probe, hits) in other.0 {
+            self.0
+                .entry(probe)
+                .and_modify(|current| *current = current.saturating_add(hits))
+                .or_insert(hits);
         }
     }
 
-    /// Merges two `SourceHitMaps`.
+    /// Records one runtime probe hit.
+    pub fn hit(&mut self, probe: ProbeId) {
+        self.0.entry(probe).and_modify(|hits| *hits = hits.saturating_add(1)).or_insert(1);
+    }
+
+    /// Merges two coverage-hit collections.
     pub fn merged(mut self, other: Self) -> Self {
         self.merge(other);
         self
     }
 }
 
-impl Deref for SourceHitMaps {
-    type Target = HashMap<usize, HitMap>;
+impl Deref for CoverageHits {
+    type Target = HashMap<ProbeId, u32>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl DerefMut for SourceHitMaps {
+impl DerefMut for CoverageHits {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
+
+/// Backwards-compatible name for source probe hits while downstream result types migrate.
+pub type SourceHitMaps = CoverageHits;
 
 /// Hit data for an address.
 ///

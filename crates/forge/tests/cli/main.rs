@@ -15,6 +15,7 @@ mod config;
 mod context;
 mod coverage;
 mod coverage_instrumented;
+mod coverage_refactor;
 mod create;
 mod debug;
 mod doc;

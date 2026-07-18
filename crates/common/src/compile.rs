@@ -178,6 +178,42 @@ impl ProjectCompiler {
         })
     }
 
+    /// Compiles the project after applying a caller-provided preprocessor to each resolved
+    /// compiler input.
+    ///
+    /// Unlike preprocessing files before project resolution, this hook observes the exact source
+    /// set, language, settings, and compiler version selected for each compilation job.
+    #[instrument(target = "forge::compile", skip_all)]
+    pub fn compile_with_preprocessor<C, P>(
+        mut self,
+        project: &Project<C>,
+        preprocessor: P,
+    ) -> Result<ProjectCompileOutput<C>>
+    where
+        C: Compiler<CompilerContract = Contract>,
+        P: Preprocessor<C> + 'static,
+    {
+        self.project_root = project.root().to_path_buf();
+
+        if !project.paths.has_input_files() && self.files.is_empty() {
+            sh_println!("Nothing to compile")?;
+            std::process::exit(0);
+        }
+
+        let files = std::mem::take(&mut self.files);
+        self.compile_with(|| {
+            let sources = if !files.is_empty() {
+                Source::read_all(files)?
+            } else {
+                project.paths.read_input_files()?
+            };
+            foundry_compilers::project::ProjectCompiler::with_sources(project, sources)?
+                .with_preprocessor(preprocessor)
+                .compile()
+                .map_err(Into::into)
+        })
+    }
+
     /// Compiles the project with the given closure
     fn compile_with<C: Compiler<CompilerContract = Contract>, F>(
         self,

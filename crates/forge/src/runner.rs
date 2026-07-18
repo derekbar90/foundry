@@ -2,7 +2,7 @@
 
 use crate::{
     MultiContractRunner, TestFilter,
-    coverage::HitMaps,
+    coverage::{HitMaps, SourceHitMaps},
     fuzz::{BaseCounterExample, FuzzTestResult},
     multi_runner::{TestContract, TestRunnerConfig},
     progress::{TestsProgress, start_fuzz_progress},
@@ -680,6 +680,10 @@ impl<'a> FunctionRunner<'a> {
             result.logs.extend(raw_call_result.logs.clone());
             result.labels.extend(raw_call_result.labels.clone());
             HitMaps::merge_opt(&mut result.line_coverage, raw_call_result.line_coverage.clone());
+            SourceHitMaps::merge_opt(
+                &mut result.source_coverage,
+                raw_call_result.source_coverage.clone(),
+            );
 
             let is_success =
                 self.executor.is_raw_call_mut_success(self.address, &mut raw_call_result, false);
