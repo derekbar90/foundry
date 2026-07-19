@@ -219,6 +219,7 @@ impl Preprocessor<MultiCompiler> for SourceCoveragePreprocessor {
                 let ast = parser
                     .parse_file()
                     .map_err(|error| format!("failed to parse source: {error:?}"))?;
+                drop(parser);
                 let mut instrumenter =
                     Instrumenter::new(&session, source_id, source_key, probe_sites);
                 let _ = instrumenter.visit_source_unit(&ast);

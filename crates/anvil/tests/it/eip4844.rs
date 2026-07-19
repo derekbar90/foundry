@@ -1,11 +1,14 @@
 use crate::utils::{http_provider, http_provider_with_signer};
-use alloy_consensus::{BlobTransactionSidecar, SidecarBuilder, SimpleCoder, Transaction};
+use alloy_consensus::{
+    BlobTransactionSidecar, EthereumTxEnvelope, SidecarBuilder, SimpleCoder, Transaction,
+    TxEip4844, proofs::calculate_transaction_root,
+};
 use alloy_eips::{
-    Typed2718,
+    Decodable2718, Typed2718,
     eip4844::{BLOB_TX_MIN_BLOB_GASPRICE, DATA_GAS_PER_BLOB, MAX_DATA_GAS_PER_BLOCK_DENCUN},
 };
 use alloy_network::{EthereumWallet, ReceiptResponse, TransactionBuilder, TransactionBuilder4844};
-use alloy_primitives::{Address, U256, b256};
+use alloy_primitives::{Address, Bytes, U256, b256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::{BlockId, TransactionRequest};
 use alloy_serde::WithOtherFields;
@@ -16,7 +19,7 @@ use foundry_test_utils::rpc;
 #[tokio::test(flavor = "multi_thread")]
 async fn can_send_eip4844_transaction() {
     let node_config = NodeConfig::test().with_hardfork(Some(EthereumHardfork::Cancun.into()));
-    let (_api, handle) = spawn(node_config).await;
+    let (api, handle) = spawn(node_config).await;
 
     let wallets = handle.dev_wallets().collect::<Vec<_>>();
     let from = wallets[0].address();
@@ -36,17 +39,54 @@ async fn can_send_eip4844_transaction() {
         .with_max_fee_per_blob_gas(gas_price + 1)
         .with_max_fee_per_gas(eip1559_est.max_fee_per_gas)
         .with_max_priority_fee_per_gas(eip1559_est.max_priority_fee_per_gas)
-        .with_blob_sidecar(sidecar)
+        .with_blob_sidecar_4844(sidecar)
         .value(U256::from(5));
 
-    let mut tx = WithOtherFields::new(tx);
-
-    tx.populate_blob_hashes();
+    let tx = WithOtherFields::new(tx);
 
     let receipt = provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
 
     assert_eq!(receipt.blob_gas_used, Some(131072));
     assert_eq!(receipt.blob_gas_price, Some(0x1)); // 1 wei
+
+    let raw: Bytes = provider
+        .client()
+        .request("eth_getRawTransactionByHash", (receipt.transaction_hash,))
+        .await
+        .unwrap();
+    let canonical = EthereumTxEnvelope::<TxEip4844>::decode_2718(&mut raw.as_ref()).unwrap();
+    let block = provider
+        .get_block_by_number(receipt.block_number.unwrap().into())
+        .full()
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(block.header.transactions_root, calculate_transaction_root(&[canonical]));
+    let tx = serde_json::to_value(&block.transactions.as_transactions().unwrap()[0]).unwrap();
+    for field in ["blobs", "commitments", "proofs", "cellProofs"] {
+        assert!(tx.get(field).is_none());
+    }
+
+    let raw_transactions: Vec<Bytes> = provider
+        .client()
+        .request("debug_getRawTransactions", (BlockId::number(block.header.number),))
+        .await
+        .unwrap();
+    assert_eq!(raw_transactions.len(), 1);
+    EthereumTxEnvelope::<TxEip4844>::decode_2718(&mut raw_transactions[0].as_ref()).unwrap();
+
+    let raw_block: Bytes = provider
+        .client()
+        .request("debug_getRawBlock", (BlockId::number(block.header.number),))
+        .await
+        .unwrap();
+    assert_eq!(block.header.size, Some(U256::from(raw_block.len())));
+    let decoded: alloy_consensus::Block<EthereumTxEnvelope<TxEip4844>> =
+        alloy_rlp::Decodable::decode(&mut raw_block.as_ref()).unwrap();
+    assert_eq!(decoded.body.transactions.len(), 1);
+
+    assert!(api.anvil_get_blob_by_tx_hash(receipt.transaction_hash).unwrap().is_some());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -67,7 +107,7 @@ async fn can_send_eip4844_transaction_fork() {
     let tx = TransactionRequest::default()
         .with_from(alice)
         .with_to(bob)
-        .with_blob_sidecar(sidecar.clone());
+        .with_blob_sidecar_4844(sidecar.clone());
 
     let pending_tx = provider.send_transaction(tx.into()).await.unwrap();
     let receipt = pending_tx.get_receipt().await.unwrap();
@@ -94,7 +134,30 @@ async fn can_send_eip4844_transaction_eth_send_transaction() {
     let tx = TransactionRequest::default()
         .with_from(alice)
         .with_to(bob)
-        .with_blob_sidecar(sidecar.clone());
+        .with_blob_sidecar_4844(sidecar.clone());
+
+    let pending_tx = provider.send_transaction(tx).await.unwrap();
+    let receipt = pending_tx.get_receipt().await.unwrap();
+    let tx_hash = receipt.transaction_hash;
+
+    let _blobs = api.anvil_get_blob_by_tx_hash(tx_hash).unwrap().unwrap();
+}
+
+// <https://github.com/foundry-rs/foundry/issues/13217>
+#[tokio::test(flavor = "multi_thread")]
+async fn can_send_eip4844_transaction_with_eip7594_sidecar_format() {
+    let node_config = NodeConfig::test().with_hardfork(Some(EthereumHardfork::Osaka.into()));
+    let (api, handle) = spawn(node_config).await;
+    let provider = ProviderBuilder::new().connect(handle.http_endpoint().as_str()).await.unwrap();
+    let accounts = provider.get_accounts().await.unwrap();
+    let alice = accounts[0];
+    let bob = accounts[1];
+
+    let sidecar: SidecarBuilder<SimpleCoder> = SidecarBuilder::from_slice(b"Blobs are fun!");
+    let sidecar = sidecar.build_7594().unwrap();
+
+    let tx =
+        TransactionRequest::default().with_from(alice).with_to(bob).with_blob_sidecar_7594(sidecar);
 
     let pending_tx = provider.send_transaction(tx).await.unwrap();
     let receipt = pending_tx.get_receipt().await.unwrap();
@@ -130,10 +193,8 @@ async fn can_send_multiple_blobs_in_one_tx() {
         .with_max_fee_per_blob_gas(gas_price + 1)
         .with_max_fee_per_gas(eip1559_est.max_fee_per_gas)
         .with_max_priority_fee_per_gas(eip1559_est.max_priority_fee_per_gas)
-        .with_blob_sidecar(sidecar);
-    let mut tx = WithOtherFields::new(tx);
-
-    tx.populate_blob_hashes();
+        .with_blob_sidecar_4844(sidecar);
+    let tx = WithOtherFields::new(tx);
 
     let receipt = provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
 
@@ -168,10 +229,8 @@ async fn cannot_exceed_six_blobs() {
         .with_max_fee_per_blob_gas(gas_price + 1)
         .with_max_fee_per_gas(eip1559_est.max_fee_per_gas)
         .with_max_priority_fee_per_gas(eip1559_est.max_priority_fee_per_gas)
-        .with_blob_sidecar(sidecar);
-    let mut tx = WithOtherFields::new(tx);
-
-    tx.populate_blob_hashes();
+        .with_blob_sidecar_4844(sidecar);
+    let tx = WithOtherFields::new(tx);
 
     let err = provider.send_transaction(tx).await.unwrap_err();
 
@@ -208,10 +267,8 @@ async fn can_mine_blobs_when_exceeds_max_blobs() {
         .with_max_fee_per_blob_gas(gas_price + 1)
         .with_max_fee_per_gas(eip1559_est.max_fee_per_gas)
         .with_max_priority_fee_per_gas(eip1559_est.max_priority_fee_per_gas)
-        .with_blob_sidecar(sidecar);
+        .with_blob_sidecar_4844(sidecar);
     let mut tx = WithOtherFields::new(tx);
-
-    tx.populate_blob_hashes();
 
     let first_tx = provider.send_transaction(tx.clone()).await.unwrap();
 
@@ -222,9 +279,8 @@ async fn can_mine_blobs_when_exceeds_max_blobs() {
     let num_blobs_second = sidecar.clone().take().len() as u64;
 
     let sidecar = sidecar.build().unwrap();
-    tx.set_blob_sidecar(sidecar);
+    tx.set_blob_sidecar_4844(sidecar);
     tx.set_nonce(1);
-    tx.populate_blob_hashes();
     let second_tx = provider.send_transaction(tx).await.unwrap();
 
     api.mine_one().await;
@@ -279,7 +335,7 @@ async fn can_correctly_estimate_blob_gas_with_recommended_fillers() {
     let sidecar: SidecarBuilder<SimpleCoder> = SidecarBuilder::from_slice(b"Blobs are fun!");
     let sidecar = sidecar.build().unwrap();
 
-    let tx = TransactionRequest::default().with_to(bob).with_blob_sidecar(sidecar);
+    let tx = TransactionRequest::default().with_to(bob).with_blob_sidecar_4844(sidecar);
     let tx = WithOtherFields::new(tx);
 
     // Send the transaction and wait for the broadcast.
@@ -325,7 +381,7 @@ async fn can_correctly_estimate_blob_gas_with_recommended_fillers_with_signer() 
     let sidecar: SidecarBuilder<SimpleCoder> = SidecarBuilder::from_slice(b"Blobs are fun!");
     let sidecar = sidecar.build().unwrap();
 
-    let tx = TransactionRequest::default().with_to(bob).with_blob_sidecar(sidecar);
+    let tx = TransactionRequest::default().with_to(bob).with_blob_sidecar_4844(sidecar);
     let tx = WithOtherFields::new(tx);
 
     // Send the transaction and wait for the broadcast.
@@ -425,12 +481,10 @@ async fn can_get_blobs_by_versioned_hash() {
         .with_max_fee_per_blob_gas(gas_price + 1)
         .with_max_fee_per_gas(eip1559_est.max_fee_per_gas)
         .with_max_priority_fee_per_gas(eip1559_est.max_priority_fee_per_gas)
-        .with_blob_sidecar(sidecar.clone())
+        .with_blob_sidecar_4844(sidecar.clone())
         .value(U256::from(5));
 
-    let mut tx = WithOtherFields::new(tx);
-
-    tx.populate_blob_hashes();
+    let tx = WithOtherFields::new(tx);
 
     let _receipt = provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
 
@@ -463,13 +517,10 @@ async fn can_get_blobs_by_tx_hash() {
         .with_max_fee_per_blob_gas(gas_price + 1)
         .with_max_fee_per_gas(eip1559_est.max_fee_per_gas)
         .with_max_priority_fee_per_gas(eip1559_est.max_priority_fee_per_gas)
-        .with_blob_sidecar(sidecar.clone())
+        .with_blob_sidecar_4844(sidecar.clone())
         .value(U256::from(5));
 
-    let mut tx = WithOtherFields::new(tx);
-
-    tx.populate_blob_hashes();
-
+    let tx = WithOtherFields::new(tx);
     let receipt = provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
     let hash = receipt.transaction_hash;
     api.anvil_set_auto_mine(true).await.unwrap();

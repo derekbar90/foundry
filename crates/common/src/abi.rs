@@ -16,7 +16,7 @@ where
     let args: Vec<S> = args.into_iter().collect();
 
     if inputs.len() != args.len() {
-        eyre::bail!("encode length mismatch: expected {} types, got {}", inputs.len(), args.len())
+        eyre::bail!("encode length mismatch: expected {} types, got {}", inputs.len(), args.len());
     }
 
     std::iter::zip(inputs, args)
@@ -92,7 +92,7 @@ pub fn abi_decode_calldata(
 
     // in case the decoding worked but nothing was decoded
     if res.is_empty() {
-        eyre::bail!("no data was decoded")
+        eyre::bail!("no data was decoded");
     }
 
     Ok(res)
@@ -143,8 +143,13 @@ pub async fn get_func_etherscan(
     args: &[String],
     chain: Chain,
     etherscan_api_key: &str,
+    etherscan_api_url: Option<&str>,
 ) -> Result<Function> {
-    let client = Client::new(chain, etherscan_api_key)?;
+    let client = if let Some(api_url) = etherscan_api_url {
+        Client::builder().with_api_key(etherscan_api_key).with_api_url(api_url)?.build()?
+    } else {
+        Client::new(chain, etherscan_api_key)?
+    };
     let source = find_source(client, contract).await?;
     let metadata = source.items.first().wrap_err("etherscan returned empty metadata")?;
 

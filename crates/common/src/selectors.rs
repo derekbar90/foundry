@@ -124,7 +124,7 @@ impl OpenChainClient {
 
     fn ensure_not_spurious(&self) -> eyre::Result<()> {
         if self.is_spurious() {
-            eyre::bail!("Spurious connection detected")
+            eyre::bail!("Spurious connection detected");
         }
         Ok(())
     }
@@ -173,7 +173,9 @@ impl OpenChainClient {
         let text = self.get_text(url).await?;
         let SignatureResponse { ok, result } = match serde_json::from_str(&text) {
             Ok(response) => response,
-            Err(err) => eyre::bail!("could not decode response: {err}: {text}"),
+            Err(err) => {
+                eyre::bail!("could not decode response: {err}: {text}");
+            }
         };
         if !ok {
             eyre::bail!("OpenChain returned an error: {text}");
@@ -214,7 +216,7 @@ impl OpenChainClient {
             eyre::bail!(
                 "Calldata too short: expected at least 8 characters (excluding 0x prefix), got {}.",
                 calldata.len()
-            )
+            );
         }
 
         let mut sigs = self.decode_function_selector(calldata[..8].parse()?).await?;
@@ -265,7 +267,7 @@ impl OpenChainClient {
         let (_, data) = calldata.split_at(8);
 
         if !data.len().is_multiple_of(64) {
-            eyre::bail!("\nInvalid calldata size")
+            eyre::bail!("\nInvalid calldata size");
         }
 
         let row_length = data.len() / 64;
@@ -371,7 +373,7 @@ pub enum SelectorKind {
 
 impl SelectorKind {
     /// Returns the function selector if it is a function OR custom error.
-    pub fn as_function(&self) -> Option<Selector> {
+    pub const fn as_function(&self) -> Option<Selector> {
         match *self {
             Self::Function(selector) | Self::Error(selector) => Some(selector),
             _ => None,
@@ -379,7 +381,7 @@ impl SelectorKind {
     }
 
     /// Returns the event selector if it is an event.
-    pub fn as_event(&self) -> Option<B256> {
+    pub const fn as_event(&self) -> Option<B256> {
         match *self {
             Self::Event(hash) => Some(hash),
             _ => None,
@@ -444,7 +446,7 @@ pub struct RawSelectorImportData {
 }
 
 impl RawSelectorImportData {
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.function.is_empty() && self.event.is_empty() && self.error.is_empty()
     }
 }
@@ -482,18 +484,18 @@ pub struct SelectorImportResponse {
 impl SelectorImportResponse {
     /// Print info about the functions which were uploaded or already known
     pub fn describe(&self) {
-        self.result.function.imported.iter().for_each(|(k, v)| {
+        for (k, v) in &self.result.function.imported {
             let _ = sh_println!("Imported: Function {k}: {v}");
-        });
-        self.result.event.imported.iter().for_each(|(k, v)| {
+        }
+        for (k, v) in &self.result.event.imported {
             let _ = sh_println!("Imported: Event {k}: {v}");
-        });
-        self.result.function.duplicated.iter().for_each(|(k, v)| {
+        }
+        for (k, v) in &self.result.function.duplicated {
             let _ = sh_println!("Duplicated: Function {k}: {v}");
-        });
-        self.result.event.duplicated.iter().for_each(|(k, v)| {
+        }
+        for (k, v) in &self.result.event.duplicated {
             let _ = sh_println!("Duplicated: Event {k}: {v}");
-        });
+        }
 
         let _ = sh_println!("Selectors successfully uploaded to OpenChain");
     }
@@ -535,6 +537,7 @@ pub fn parse_signatures(tokens: Vec<String>) -> ParsedSignatures {
         RawSelectorImportData::default(),
         |mut data, signature| {
             let mut split = signature.split(' ');
+            #[allow(clippy::collapsible_match)]
             match split.next() {
                 Some("function") => {
                     if let Some(sig) = split.next() {

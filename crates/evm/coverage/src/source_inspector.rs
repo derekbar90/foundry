@@ -56,6 +56,7 @@ where
             memory_offset: inputs.return_memory_offset.clone(),
             was_precompile_called: false,
             precompile_call_logs: vec![],
+            charged_new_account_state_gas: false,
         })
     }
 }

@@ -1,7 +1,9 @@
 use crate::eth::backend::db::{
     Db, MaybeForkedDatabase, MaybeFullDatabase, SerializableAccountRecord, SerializableBlock,
     SerializableHistoricalStates, SerializableState, SerializableTransaction, StateDb,
+    cache_block_hash,
 };
+use alloy_network::Network;
 use alloy_primitives::{Address, B256, U256, map::AddressMap};
 use alloy_rpc_types::BlockId;
 use foundry_evm::{
@@ -16,7 +18,7 @@ use revm::{
 
 pub use foundry_evm::fork::database::ForkedDatabase;
 
-impl Db for ForkedDatabase {
+impl<N: Network> Db for ForkedDatabase<N> {
     fn insert_account(&mut self, address: Address, account: AccountInfo) {
         self.database_mut().insert_account(address, account)
     }
@@ -28,7 +30,11 @@ impl Db for ForkedDatabase {
     }
 
     fn insert_block_hash(&mut self, number: U256, hash: B256) {
-        self.inner().block_hashes().write().insert(number, hash);
+        cache_block_hash(&mut self.inner().block_hashes().write(), number, hash);
+    }
+
+    fn set_block_hashes(&mut self, block_hashes: Vec<(U256, B256)>) {
+        *self.inner().block_hashes().write() = block_hashes.into_iter().collect();
     }
 
     fn dump_state(
@@ -86,7 +92,7 @@ impl Db for ForkedDatabase {
     }
 }
 
-impl MaybeFullDatabase for ForkedDatabase {
+impl<N: Network> MaybeFullDatabase for ForkedDatabase<N> {
     fn maybe_as_full_db(&self) -> Option<&AddressMap<DbAccount>> {
         Some(&self.database().cache.accounts)
     }
@@ -121,7 +127,7 @@ impl MaybeFullDatabase for ForkedDatabase {
     }
 }
 
-impl MaybeFullDatabase for ForkDbStateSnapshot {
+impl<N: Network> MaybeFullDatabase for ForkDbStateSnapshot<N> {
     fn maybe_as_full_db(&self) -> Option<&AddressMap<DbAccount>> {
         Some(&self.local.cache.accounts)
     }
@@ -154,9 +160,9 @@ impl MaybeFullDatabase for ForkDbStateSnapshot {
     }
 }
 
-impl MaybeForkedDatabase for ForkedDatabase {
-    fn maybe_reset(&mut self, url: Option<String>, block_number: BlockId) -> Result<(), String> {
-        self.reset(url, block_number)
+impl<N: Network> MaybeForkedDatabase for ForkedDatabase<N> {
+    fn maybe_reset(&mut self, urls: Vec<String>, block_number: BlockId) -> Result<(), String> {
+        self.reset(urls, block_number)
     }
 
     fn maybe_flush_cache(&self) -> Result<(), String> {

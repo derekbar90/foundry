@@ -1,5 +1,200 @@
 //! Tests for the `forge test` with preprocessed cache.
 
+#[cfg(unix)]
+forgetest_init!(filtered_tests_reuse_preprocessed_cache, |prj, cmd| {
+    use foundry_test_utils::util::OutputExt;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    prj.initialize_default_contracts();
+    prj.update_config(|config| config.dynamic_test_linking = true);
+    cmd.arg("build").assert_success();
+
+    let solc = prj.root().join("fake-solc");
+    let invoked = prj.root().join("fake-solc.invoked");
+    fs::write(
+        &solc,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+    exit 0
+fi
+touch "$0.invoked"
+exit 1
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&solc).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&solc, permissions).unwrap();
+    prj.update_config(|config| {
+        config.solc = Some(foundry_config::SolcReq::Local(solc));
+    });
+
+    let output =
+        cmd.forge_fuse().args(["test", "--match-contract", "CounterTest"]).assert_success();
+    let stdout = output.get_output().stdout_lossy();
+    assert!(
+        stdout.contains("Ran 2 tests for test/Counter.t.sol:CounterTest"),
+        "cached ABI did not select CounterTest: {stdout}"
+    );
+    assert!(!invoked.exists(), "filtered test compilation did not reuse the preprocessed cache");
+});
+
+// <https://github.com/foundry-rs/foundry/issues/8842>
+forgetest_init!(filtered_tests_compile_unimported_test_fixtures, |prj, cmd| {
+    prj.update_config(|config| config.solc = None);
+    prj.add_raw_test(
+        "fixtures/Fixture.sol",
+        r#"
+pragma solidity 0.7.6;
+
+contract Fixture {
+    function version() external pure returns (uint256) {
+        return 1;
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "Fixture.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+
+interface IFixture {
+    function version() external pure returns (uint256);
+}
+
+contract FixtureTest is Test {
+    function testFixture() public {
+        address fixture = vm.deployCode("test/fixtures/Fixture.sol:Fixture");
+        assertEq(IFixture(fixture).version(), 1);
+    }
+}
+"#,
+    );
+
+    cmd.args(["test", "--match-contract", "FixtureTest"]).assert_success().stdout_eq(str![[r#"
+...
+Ran 1 test for test/Fixture.t.sol:FixtureTest
+[PASS] testFixture() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]]);
+
+    prj.add_raw_test(
+        "fixtures/Fixture.sol",
+        r#"
+pragma solidity 0.7.6;
+
+contract Fixture {
+    function version() external pure returns (uint256) {
+        return 2;
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "Fixture.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+
+interface IFixture {
+    function version() external pure returns (uint256);
+}
+
+contract FixtureTest is Test {
+    function testFixture() public {
+        address fixture = vm.deployCode("test/fixtures/Fixture.sol:Fixture");
+        assertEq(IFixture(fixture).version(), 2);
+    }
+}
+"#,
+    );
+
+    cmd.assert_success().stdout_eq(str![[r#"
+...
+Ran 1 test for test/Fixture.t.sol:FixtureTest
+[PASS] testFixture() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]]);
+});
+
+// <https://github.com/foundry-rs/foundry/issues/8842>
+forgetest_init!(path_filtered_tests_compile_unimported_test_fixtures, |prj, cmd| {
+    prj.update_config(|config| {
+        config.solc = None;
+        config.dynamic_test_linking = false;
+    });
+    prj.add_raw_script("Broken.s.sol", "this is not valid Solidity");
+    prj.add_raw_test(
+        "fixtures/Fixture.sol",
+        r#"
+pragma solidity 0.7.6;
+
+contract Fixture {}
+"#,
+    );
+    prj.add_test(
+        "Fixture.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+
+contract FixtureTest is Test {
+    function testFixture() public {
+        assertGt(vm.getCode("test/fixtures/Fixture.sol:Fixture").length, 0);
+    }
+}
+"#,
+    );
+
+    cmd.args(["test", "--match-path", "test/Fixture.t.sol"]).assert_success().stdout_eq(str![[
+        r#"
+...
+Ran 1 test for test/Fixture.t.sol:FixtureTest
+[PASS] testFixture() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#
+    ]]);
+});
+
+forgetest_init!(filtered_tests_support_overlapping_source_roots, |prj, cmd| {
+    prj.update_config(|config| config.script = ".".into());
+    prj.add_source("SourceFixture.sol", "contract SourceFixture {}");
+    prj.add_test("fixtures/Fixture.sol", "contract Fixture {}");
+    prj.add_test(
+        "Fixture.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+
+contract FixtureTest is Test {
+    function testFixture() public {
+        assertGt(vm.getCode("test/fixtures/Fixture.sol:Fixture").length, 0);
+        assertGt(vm.getCode("src/SourceFixture.sol:SourceFixture").length, 0);
+    }
+}
+"#,
+    );
+
+    cmd.args(["test", "--match-contract", "FixtureTest"]).assert_success().stdout_eq(str![[r#"
+...
+Ran 1 test for test/Fixture.t.sol:FixtureTest
+[PASS] testFixture() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]]);
+});
+
 // Test cache is invalidated when `forge build` if optimize test option toggled.
 forgetest_init!(toggle_invalidate_cache_on_build, |prj, cmd| {
     prj.initialize_default_contracts();
@@ -1374,7 +1569,6 @@ Compiling 21 files with [..]
 });
 
 // Test preprocessed contracts with decode internal fns.
-#[cfg(not(feature = "isolate-by-default"))]
 forgetest_init!(preprocess_contract_with_decode_internal, |prj, cmd| {
     prj.initialize_default_contracts();
     prj.update_config(|config| {
@@ -1418,16 +1612,16 @@ Ran 1 test for test/Counter.t.sol:CounterTest
 Traces:
   [..] CounterTest::test_Increment()
     ├─ [0] VM::deployCode("src/Counter.sol:Counter")
-    │   ├─ [96345] → new Counter@0x2e234DAe75C793f67A35089C9d99245E1C58470b
+    │   ├─ [96345] → new Counter@0xF62849F9A0B5Bf2913b396098F7c7019b51A820a
     │   │   └─ ← [Return] 481 bytes of code
-    │   └─ ← [Return] Counter: [0x2e234DAe75C793f67A35089C9d99245E1C58470b]
+    │   └─ ← [Return] Counter: [0xF62849F9A0B5Bf2913b396098F7c7019b51A820a]
     ├─ [..] Counter::setNumber(0)
     │   └─ ← [Stop]
     ├─ [..] Counter::increment()
     │   └─ ← [Stop]
     ├─ [..] Counter::number() [staticcall]
     │   └─ ← [Return] 1
-    ├─ [..] StdAssertions::assertEq(1, 1)
+    ├─ [..] StdAssertions::assertEq(uint256,uint256)(1, 1)
     │   └─ ← 
     └─ ← [Stop]
 
@@ -1766,6 +1960,86 @@ contract TargetTest is Test {
     function testComputeAddress() public view {
         computeAddress(address(this), 1, 100);
     }
+}
+        "#,
+    );
+
+    cmd.args(["build"]).assert_success();
+});
+
+// Test that `type(Contract).creationCode` keeps native pure semantics when dynamic linking is
+// enabled.
+forgetest_init!(preprocess_creation_code_in_pure_function, |prj, cmd| {
+    prj.update_config(|config| {
+        config.dynamic_test_linking = true;
+    });
+
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    uint256 public immutable value;
+    constructor(uint256 _value) { value = _value; }
+}
+        "#,
+    );
+
+    prj.add_test(
+        "Target.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+import {Target} from "../src/Target.sol";
+
+contract TargetTest is Test {
+    function computeAddress(address factory, uint256 salt, uint256 value) internal pure returns (address) {
+        bytes32 hash = keccak256(
+            abi.encodePacked(
+                bytes1(0xff),
+                factory,
+                salt,
+                keccak256(abi.encodePacked(type(Target).creationCode, abi.encode(value)))
+            )
+        );
+        return address(uint160(uint256(hash)));
+    }
+
+    function testComputeAddress() public pure {
+        computeAddress(address(0xBEEF), 1, 100);
+    }
+}
+        "#,
+    );
+
+    cmd.args(["build"]).assert_success();
+});
+
+// Test that `type(Contract).creationCode` keeps native pure semantics when it is used in a
+// modifier body that is applied to a pure function.
+forgetest_init!(preprocess_creation_code_in_modifier_used_by_pure_function, |prj, cmd| {
+    prj.update_config(|config| {
+        config.dynamic_test_linking = true;
+    });
+
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {}
+        "#,
+    );
+
+    prj.add_test(
+        "ModifierCreationCode.t.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+contract ModifierCreationCodeTest {
+    modifier usesCreationCode() {
+        bytes memory code = type(Target).creationCode;
+        code;
+        _;
+    }
+
+    function testModifierCreationCode() public pure usesCreationCode {}
 }
         "#,
     );

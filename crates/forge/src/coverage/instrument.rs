@@ -820,6 +820,7 @@ mod tests {
                     panic!("Parse error: {:?}", diag);
                 }
             };
+            drop(parser);
 
             let mut instrumenter = Instrumenter::new(&sess, 0, SourceKey::default(), Vec::new());
             let _ = instrumenter.visit_source_unit(&ast);
@@ -859,6 +860,7 @@ contract D is C {
                     panic!("Parse error: {:?}", diag);
                 }
             };
+            drop(parser);
 
             let mut instrumenter = Instrumenter::new(&sess, 0, SourceKey::default(), Vec::new());
             let _ = instrumenter.visit_source_unit(&ast);
@@ -913,6 +915,7 @@ contract C {
             )
             .unwrap();
             let ast = parser.parse_file().unwrap();
+            drop(parser);
             let mut instrumenter = Instrumenter::new(&sess, 0, SourceKey::default(), Vec::new());
             let _ = instrumenter.visit_source_unit(&ast);
             instrumenter.instrument(&mut transformed).unwrap();

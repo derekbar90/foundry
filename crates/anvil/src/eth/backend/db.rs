@@ -6,11 +6,14 @@ use std::{
     path::Path,
 };
 
-use alloy_consensus::{BlockBody, Header};
+use alloy_consensus::BlockBody;
+#[cfg(test)]
+use alloy_consensus::Header;
 use alloy_eips::eip4895::Withdrawals;
+use alloy_network::Network;
 use alloy_primitives::{
     Address, B256, Bytes, U256, keccak256,
-    map::{AddressMap, HashMap},
+    map::{AddressMap, HashMap, U256Map},
 };
 use alloy_rpc_types::BlockId;
 use anvil_core::eth::{
@@ -21,7 +24,7 @@ use foundry_common::errors::FsPathError;
 use foundry_evm::backend::{
     BlockchainDb, DatabaseError, DatabaseResult, MemDb, RevertStateSnapshotAction, StateSnapshot,
 };
-use foundry_primitives::{FoundryReceiptEnvelope, FoundryTxEnvelope};
+use foundry_primitives::{FoundryHeader, FoundryReceiptEnvelope, FoundryTxEnvelope};
 use revm::{
     Database, DatabaseCommit,
     bytecode::Bytecode,
@@ -39,10 +42,29 @@ use serde_json::Value;
 
 use crate::mem::storage::MinedTransaction;
 
+/// Number of preceding block hashes available to the EVM's `BLOCKHASH` opcode.
+pub(crate) const BLOCKHASH_HISTORY: u64 = 256;
+
+/// Inserts a block hash, discards entries outside the EVM-visible cache, and returns its head.
+pub(crate) fn cache_block_hash(block_hashes: &mut U256Map<B256>, number: U256, hash: B256) -> U256 {
+    let head = block_hashes.keys().copied().max().map_or(number, |head| head.max(number));
+    let min_number = head.saturating_sub(U256::from(BLOCKHASH_HISTORY));
+    block_hashes.retain(|cached, _| *cached >= min_number && *cached <= head);
+    if number >= min_number {
+        block_hashes.insert(number, hash);
+    }
+    head
+}
+
 /// Helper trait get access to the full state data of the database
 pub trait MaybeFullDatabase: DatabaseRef<Error = DatabaseError> + Debug {
     fn maybe_as_full_db(&self) -> Option<&AddressMap<DbAccount>> {
         None
+    }
+
+    /// Returns whether snapshots of this database use structural sharing.
+    fn is_persistent(&self) -> bool {
+        false
     }
 
     /// Clear the state and move it into a new `StateSnapshot`.
@@ -68,6 +90,10 @@ where
         T::maybe_as_full_db(self)
     }
 
+    fn is_persistent(&self) -> bool {
+        T::is_persistent(self)
+    }
+
     fn clear_into_state_snapshot(&mut self) -> StateSnapshot {
         unreachable!("never called for DatabaseRef")
     }
@@ -83,11 +109,84 @@ where
 
 /// Helper trait to reset the DB if it's forked
 pub trait MaybeForkedDatabase {
-    fn maybe_reset(&mut self, _url: Option<String>, block_number: BlockId) -> Result<(), String>;
+    fn maybe_reset(&mut self, _urls: Vec<String>, block_number: BlockId) -> Result<(), String>;
 
     fn maybe_flush_cache(&self) -> Result<(), String>;
 
     fn maybe_inner(&self) -> Result<&BlockchainDb, String>;
+}
+
+/// `dyn Db` satisfies all `alloy_evm::Database` requirements via its supertraits, but the
+/// blanket impl has an implicit `Sized` bound. Provide an explicit impl.
+impl alloy_evm::Database for dyn Db {}
+
+/// A wrapper around [`CacheDB`].
+#[derive(Debug)]
+pub struct AnvilCacheDB<T>(pub CacheDB<T>);
+
+impl<T: DatabaseRef<Error = DatabaseError>> AnvilCacheDB<T> {
+    pub fn new(inner: T) -> Self {
+        Self(CacheDB::new(inner))
+    }
+}
+
+impl<T: DatabaseRef<Error = DatabaseError>> std::ops::Deref for AnvilCacheDB<T> {
+    type Target = CacheDB<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: DatabaseRef<Error = DatabaseError>> std::ops::DerefMut for AnvilCacheDB<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T: DatabaseRef<Error = DatabaseError> + fmt::Debug> Database for AnvilCacheDB<T> {
+    type Error = DatabaseError;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.0.basic(address)
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.0.code_by_hash(code_hash)
+    }
+
+    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        self.0.storage(address, index)
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        self.0.block_hash(number)
+    }
+}
+
+impl<T: DatabaseRef<Error = DatabaseError>> DatabaseRef for AnvilCacheDB<T> {
+    type Error = DatabaseError;
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.0.basic_ref(address)
+    }
+
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.0.code_by_hash_ref(code_hash)
+    }
+
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        self.0.storage_ref(address, index)
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        self.0.block_hash_ref(number)
+    }
+}
+
+impl<T: DatabaseRef<Error = DatabaseError> + fmt::Debug> DatabaseCommit for AnvilCacheDB<T> {
+    fn commit(&mut self, changes: revm::state::EvmState) {
+        self.0.commit(changes)
+    }
 }
 
 /// This bundles all required revm traits
@@ -129,7 +228,7 @@ pub trait Db:
             B256::from_slice(&keccak256(code.as_ref())[..])
         };
         info.code_hash = code_hash;
-        info.code = Some(Bytecode::new_raw(alloy_primitives::Bytes(code.0)));
+        info.code = Some(Bytecode::new_raw(code));
         self.insert_account(address, info);
         Ok(())
     }
@@ -139,6 +238,9 @@ pub trait Db:
 
     /// inserts a blockhash for the given number
     fn insert_block_hash(&mut self, number: U256, hash: B256);
+
+    /// Replaces all cached block hashes.
+    fn set_block_hashes(&mut self, block_hashes: Vec<(U256, B256)>);
 
     /// Write all chain data to serialized bytes buffer
     fn dump_state(
@@ -152,7 +254,7 @@ pub trait Db:
 
     /// Deserialize and add all chain data to the backend storage
     fn load_state(&mut self, state: SerializableState) -> DatabaseResult<bool> {
-        for (addr, account) in state.accounts.into_iter() {
+        for (addr, account) in state.accounts {
             let old_account_nonce = DatabaseRef::basic_ref(self, addr)
                 .ok()
                 .and_then(|acc| acc.map(|acc| acc.nonce))
@@ -169,14 +271,14 @@ pub trait Db:
                     code: if account.code.0.is_empty() {
                         None
                     } else {
-                        Some(Bytecode::new_raw(alloy_primitives::Bytes(account.code.0)))
+                        Some(Bytecode::new_raw(account.code))
                     },
                     nonce,
                     account_id: None,
                 },
             );
 
-            for (k, v) in account.storage.into_iter() {
+            for (k, v) in account.storage {
                 self.set_storage_at(addr, k, v)?;
             }
         }
@@ -214,7 +316,11 @@ impl<T: DatabaseRef<Error = DatabaseError> + Send + Sync + Clone + fmt::Debug> D
     }
 
     fn insert_block_hash(&mut self, number: U256, hash: B256) {
-        self.cache.block_hashes.insert(number, hash);
+        cache_block_hash(&mut self.cache.block_hashes, number, hash);
+    }
+
+    fn set_block_hashes(&mut self, block_hashes: Vec<(U256, B256)>) {
+        self.cache.block_hashes = block_hashes.into_iter().collect();
     }
 
     fn dump_state(
@@ -301,7 +407,7 @@ impl<T: DatabaseRef<Error = DatabaseError> + Debug> MaybeFullDatabase for CacheD
 }
 
 impl<T: DatabaseRef<Error = DatabaseError>> MaybeForkedDatabase for CacheDB<T> {
-    fn maybe_reset(&mut self, _url: Option<String>, _block_number: BlockId) -> Result<(), String> {
+    fn maybe_reset(&mut self, _urls: Vec<String>, _block_number: BlockId) -> Result<(), String> {
         Err("not supported".to_string())
     }
 
@@ -352,6 +458,10 @@ impl DatabaseRef for StateDb {
 impl MaybeFullDatabase for StateDb {
     fn maybe_as_full_db(&self) -> Option<&AddressMap<DbAccount>> {
         self.0.maybe_as_full_db()
+    }
+
+    fn is_persistent(&self) -> bool {
+        self.0.is_persistent()
     }
 
     fn clear_into_state_snapshot(&mut self) -> StateSnapshot {
@@ -430,6 +540,7 @@ impl TryFrom<LegacyBlockEnv> for BlockEnv {
             basefee: legacy.basefee.and_then(|v| v.to_u64()).unwrap_or(0),
             difficulty: legacy.difficulty.and_then(|v| v.to_u256()).unwrap_or(U256::ZERO),
             prevrandao: legacy.prevrandao.or(Some(B256::ZERO)),
+            slot_num: 0,
             blob_excess_gas_and_price: legacy
                 .blob_excess_gas_and_price
                 .map(|v| BlobExcessGasAndPrice::new(v.excess_blob_gas, v.blob_gasprice))
@@ -576,14 +687,14 @@ where
 #[serde(untagged)]
 pub enum SerializableTransactionType {
     TypedTransaction(FoundryTxEnvelope),
-    MaybeImpersonatedTransaction(MaybeImpersonatedTransaction),
+    MaybeImpersonatedTransaction(MaybeImpersonatedTransaction<FoundryTxEnvelope>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SerializableBlock {
-    pub header: Header,
+    pub header: FoundryHeader,
     pub transactions: Vec<SerializableTransactionType>,
-    pub ommers: Vec<Header>,
+    pub ommers: Vec<FoundryHeader>,
     #[serde(default)]
     pub withdrawals: Option<Withdrawals>,
 }
@@ -608,13 +719,13 @@ impl From<SerializableBlock> for Block {
     }
 }
 
-impl From<MaybeImpersonatedTransaction> for SerializableTransactionType {
-    fn from(transaction: MaybeImpersonatedTransaction) -> Self {
+impl From<MaybeImpersonatedTransaction<FoundryTxEnvelope>> for SerializableTransactionType {
+    fn from(transaction: MaybeImpersonatedTransaction<FoundryTxEnvelope>) -> Self {
         Self::MaybeImpersonatedTransaction(transaction)
     }
 }
 
-impl From<SerializableTransactionType> for MaybeImpersonatedTransaction {
+impl From<SerializableTransactionType> for MaybeImpersonatedTransaction<FoundryTxEnvelope> {
     fn from(transaction: SerializableTransactionType) -> Self {
         match transaction {
             SerializableTransactionType::TypedTransaction(tx) => Self::new(tx),
@@ -631,8 +742,10 @@ pub struct SerializableTransaction {
     pub block_number: u64,
 }
 
-impl From<MinedTransaction> for SerializableTransaction {
-    fn from(transaction: MinedTransaction) -> Self {
+impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> From<MinedTransaction<N>>
+    for SerializableTransaction
+{
+    fn from(transaction: MinedTransaction<N>) -> Self {
         Self {
             info: transaction.info,
             receipt: transaction.receipt,
@@ -642,7 +755,9 @@ impl From<MinedTransaction> for SerializableTransaction {
     }
 }
 
-impl From<SerializableTransaction> for MinedTransaction {
+impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> From<SerializableTransaction>
+    for MinedTransaction<N>
+{
     fn from(transaction: SerializableTransaction) -> Self {
         Self {
             info: transaction.info,
@@ -741,7 +856,7 @@ mod test {
             ommers: vec![],
             withdrawals: Some(vec![withdrawal].into()),
         };
-        let block = Block::new(header, body);
+        let block = Block::new(header.into(), body);
 
         // convert to SerializableBlock and back
         let serializable = SerializableBlock::from(block);

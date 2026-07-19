@@ -87,7 +87,7 @@ impl<'gcx> SourceVisitor<'gcx> {
         }
     }
 
-    fn checkpoint(&self) -> SourceVisitorCheckpoint {
+    const fn checkpoint(&self) -> SourceVisitorCheckpoint {
         SourceVisitorCheckpoint {
             items: self.items.len(),
             all_lines: self.all_lines.len(),
@@ -159,6 +159,7 @@ impl<'gcx> SourceVisitor<'gcx> {
                     item: CoverageItem {
                         kind: CoverageItemKind::Line,
                         loc: reference_item.item.loc.clone(),
+                        anchor_loc: None,
                         hits: 0,
                     },
                     probe_site: None,
@@ -178,13 +179,20 @@ impl<'gcx> SourceVisitor<'gcx> {
 
     /// Creates a coverage item for a given kind and source location. Pushes item to the internal
     /// collection (plus additional coverage line if item is a statement).
-    fn push_item_kind(&mut self, kind: CoverageItemKind, span: Span, probe: ProbeSiteKind) {
-        let item = CoverageItem { kind, loc: self.source_location_for(span), hits: 0 };
+    fn push_item_kind(
+        &mut self,
+        kind: CoverageItemKind,
+        span: Span,
+        probe: ProbeSiteKind,
+    ) -> &mut CoverageItem {
+        let item =
+            CoverageItem { kind, loc: self.source_location_for(span), anchor_loc: None, hits: 0 };
 
         debug_assert!(!matches!(item.kind, CoverageItemKind::Line));
         self.all_lines.push(item.loc.lines.start);
 
         self.items.push(AnalyzedItem { item, probe_site: Some(probe) });
+        &mut self.items.last_mut().unwrap().item
     }
 
     fn source_location_for(&self, mut span: Span) -> SourceLocation {
@@ -218,7 +226,7 @@ impl<'gcx> SourceVisitor<'gcx> {
         first.line_index as u32 + 1..last.line_index as u32 + 2
     }
 
-    fn next_branch_id(&mut self) -> u32 {
+    const fn next_branch_id(&mut self) -> u32 {
         let id = self.branch_id;
         self.branch_id = id + 1;
         id
@@ -298,19 +306,16 @@ impl<'ast> ast::Visit<'ast> for SourceVisitor<'_> {
                         then_stmt.span,
                         ProbeSiteKind::Branch { path_id: 0 },
                     );
-                    if else_stmt.is_some() {
-                        // We use `stmt.span`, which includes `else_stmt.span`, since we need to
-                        // include the condition so that this can be marked as covered.
-                        // Initially implemented in https://github.com/foundry-rs/foundry/pull/3094.
+                    if let Some(else_stmt) = else_stmt {
+                        let is_first_opcode = stmt_has_statements(else_stmt);
+                        let anchor_loc =
+                            is_first_opcode.then(|| self.source_location_for(else_stmt.span));
                         self.push_item_kind(
-                            CoverageItemKind::Branch {
-                                branch_id,
-                                path_id: 1,
-                                is_first_opcode: false,
-                            },
+                            CoverageItemKind::Branch { branch_id, path_id: 1, is_first_opcode },
                             stmt.span,
                             ProbeSiteKind::Branch { path_id: 1 },
-                        );
+                        )
+                        .anchor_loc = anchor_loc;
                     }
                 }
             }
@@ -607,7 +612,7 @@ impl SourceAnalysis {
     }
 
     /// Returns all the mutable coverage items.
-    pub fn all_items_mut(&mut self) -> &mut Vec<CoverageItem> {
+    pub const fn all_items_mut(&mut self) -> &mut Vec<CoverageItem> {
         &mut self.all_items
     }
 
@@ -675,6 +680,7 @@ impl SourceAnalysis {
                     lines.push(CoverageItem {
                         kind: CoverageItemKind::Line,
                         loc: reference_item.loc.clone(),
+                        anchor_loc: None,
                         hits: 0,
                     });
                 }
