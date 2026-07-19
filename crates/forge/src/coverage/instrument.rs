@@ -103,8 +103,12 @@ impl<'ast> Instrumenter<'ast> {
         &self.probes
     }
 
-    pub fn unclaimed_site_count(&self) -> usize {
-        self.probe_sites.len().saturating_sub(self.claimed_sites.len())
+    pub fn unclaimed_sites(&self) -> Vec<ProbeSite> {
+        self.probe_sites
+            .iter()
+            .filter(|site| !self.claimed_sites.contains(&site.item_id))
+            .cloned()
+            .collect()
     }
 
     fn inject_hit(&mut self, span: ast::Span, probe: ProbeId) {
@@ -142,6 +146,16 @@ impl<'ast> Instrumenter<'ast> {
         span: Span,
         outcome: ProbeOutcome,
     ) -> Option<ProbeId> {
+        self.claim_site_with_probe(kind, span, outcome, None)
+    }
+
+    fn claim_site_with_probe(
+        &mut self,
+        kind: ProbeSiteKind,
+        span: Span,
+        outcome: ProbeOutcome,
+        shared_probe: Option<ProbeId>,
+    ) -> Option<ProbeId> {
         let loc = self.source_location_for(span);
         let site = self.probe_sites.iter().find(|site| {
             site.kind == kind
@@ -152,7 +166,8 @@ impl<'ast> Instrumenter<'ast> {
         })?;
         let item_id = site.item_id;
         self.claimed_sites.insert(item_id);
-        let probe = ProbeId::new(self.source_key, ItemId(item_id), outcome);
+        let probe =
+            shared_probe.unwrap_or_else(|| ProbeId::new(self.source_key, ItemId(item_id), outcome));
         self.probes.push((probe, item_id));
         Some(probe)
     }
@@ -181,8 +196,33 @@ impl<'ast> Instrumenter<'ast> {
     }
 
     fn instrument_value_tree(&mut self, expr: &'ast ast::Expr<'ast>) {
-        let rewritten = self.rewrite_expression_tree(expr, false);
+        // A root call may be void- or tuple-valued, neither of which can be placed in a ternary.
+        // Its containing statement entry is used below; nested calls necessarily have a value and
+        // can use the exact expression wrapper.
+        let rewritten = self.rewrite_expression_tree_with_probe(expr, false, None, false);
         self.push_edit(expr.span, rewritten);
+    }
+
+    fn instrument_value_tree_at_entry(
+        &mut self,
+        expr: &'ast ast::Expr<'ast>,
+        entry_probe: Option<ProbeId>,
+    ) {
+        if let Some(entry_probe) = entry_probe {
+            self.alias_entry_call(expr, entry_probe);
+        }
+        self.instrument_value_tree(expr);
+    }
+
+    fn alias_entry_call(&mut self, expr: &'ast ast::Expr<'ast>, entry_probe: ProbeId) {
+        if matches!(expr.kind, ast::ExprKind::Call(..)) {
+            let _ = self.claim_site_with_probe(
+                ProbeSiteKind::Expression,
+                expr.span,
+                ProbeOutcome::Hit,
+                Some(entry_probe),
+            );
+        }
     }
 
     fn rewrite_expression_tree(
@@ -190,6 +230,38 @@ impl<'ast> Instrumenter<'ast> {
         expr: &'ast ast::Expr<'ast>,
         expected_bool: bool,
     ) -> String {
+        self.rewrite_expression_tree_with_probe(expr, expected_bool, None, true)
+    }
+
+    fn rewrite_expression_tree_with_probe(
+        &mut self,
+        expr: &'ast ast::Expr<'ast>,
+        expected_bool: bool,
+        shared_probe: Option<ProbeId>,
+        wrap_call: bool,
+    ) -> String {
+        // A short-circuit expression and its left-most evaluated descendant are always reached
+        // together. Map those canonical items to one runtime probe instead of wrapping every AST
+        // node. Besides reducing bytecode, this prevents long `&&`/`||` chains from exhausting the
+        // legacy code generator's stack while keeping skipped right-hand expressions uncovered.
+        if let ast::ExprKind::Binary(left, operator, right) = &expr.kind
+            && matches!(operator.kind, ast::BinOpKind::And | ast::BinOpKind::Or)
+        {
+            let probe = self
+                .claim_site_with_probe(
+                    ProbeSiteKind::Expression,
+                    expr.span,
+                    ProbeOutcome::Hit,
+                    shared_probe,
+                )
+                .or(shared_probe);
+            let replacements = vec![
+                (left.span, self.rewrite_expression_tree_with_probe(left, true, probe, true)),
+                (right.span, self.rewrite_expression_tree_with_probe(right, true, None, true)),
+            ];
+            return self.rewrite_snippet(expr.span, replacements);
+        }
+
         let children: Vec<(&ast::Expr<'_>, bool)> = match &expr.kind {
             ast::ExprKind::Binary(left, operator, right) => {
                 let operands_are_bool =
@@ -213,7 +285,10 @@ impl<'ast> Instrumenter<'ast> {
         let replacements = children
             .into_iter()
             .map(|(child, child_is_bool)| {
-                (child.span, self.rewrite_expression_tree(child, child_is_bool))
+                (
+                    child.span,
+                    self.rewrite_expression_tree_with_probe(child, child_is_bool, None, true),
+                )
             })
             .collect();
         let mut rewritten = self.rewrite_snippet(expr.span, replacements);
@@ -233,29 +308,36 @@ impl<'ast> Instrumenter<'ast> {
                         | ast::BinOpKind::Ge
                 )
         ) || matches!(expr.kind, ast::ExprKind::Unary(operator, _) if matches!(operator.kind, ast::UnOpKind::Not));
-        let boolean_wrapper = (expected_bool || intrinsically_bool)
-            && matches!(
-                expr.kind,
-                ast::ExprKind::Unary(..)
-                    | ast::ExprKind::Binary(..)
-                    | ast::ExprKind::Ternary(..)
-                    | ast::ExprKind::Call(..)
-            );
+        let boolean_wrapper = shared_probe.is_some()
+            || (expected_bool || intrinsically_bool)
+                && matches!(
+                    expr.kind,
+                    ast::ExprKind::Unary(..)
+                        | ast::ExprKind::Binary(..)
+                        | ast::ExprKind::Ternary(..)
+                        | ast::ExprKind::Call(..)
+                );
         let value_wrapper = matches!(
             expr.kind,
             ast::ExprKind::Unary(..)
                 | ast::ExprKind::Binary(..)
                 | ast::ExprKind::Ternary(..)
                 | ast::ExprKind::Assign(..)
-        );
+        ) || wrap_call && matches!(expr.kind, ast::ExprKind::Call(..));
         if (boolean_wrapper || value_wrapper)
-            && let Some(probe) =
-                self.claim_site(ProbeSiteKind::Expression, expr.span, ProbeOutcome::Hit)
+            && let Some(probe) = self
+                .claim_site_with_probe(
+                    ProbeSiteKind::Expression,
+                    expr.span,
+                    ProbeOutcome::Hit,
+                    shared_probe,
+                )
+                .or(shared_probe)
         {
             if boolean_wrapper {
                 let probe = probe.solidity_literal();
                 rewritten = format!(
-                    "VmCoverage_{}({}).coverageBranch({probe},{probe},{rewritten})",
+                    "VmCoverage_{}({}).coverageBool({probe},{rewritten})",
                     self.source_key.helper_suffix(),
                     COVERAGE_ADDRESS,
                 );
@@ -286,7 +368,7 @@ impl<'ast> Instrumenter<'ast> {
     }
 
     fn loop_update(&mut self, expr: &'ast ast::Expr<'ast>) -> String {
-        let rewritten = self.rewrite_expression_tree(expr, false);
+        let rewritten = self.rewrite_expression_tree_with_probe(expr, false, None, false);
         let entry = self
             .claim_site(ProbeSiteKind::Expression, expr.span, ProbeOutcome::Hit)
             .map(|probe| self.coverage_hit(probe))
@@ -317,7 +399,7 @@ impl<'ast> Instrumenter<'ast> {
 
     pub fn interface_definition(&self) -> String {
         format!(
-            "\n\ninterface VmCoverage_{} {{ function coverageHit(bytes32) external pure; function coverageBranch(bytes32,bytes32,bool) external pure returns (bool); }}",
+            "\n\ninterface VmCoverage_{} {{ function coverageHit(bytes32) external pure; function coverageBool(bytes32,bool) external pure returns (bool); function coverageBranch(bytes32,bytes32,bool) external pure returns (bool); }}",
             self.source_key.helper_suffix()
         )
     }
@@ -444,46 +526,46 @@ impl<'ast> Visit<'ast> for Instrumenter<'ast> {
                 return ControlFlow::Continue(());
             }
             ast::StmtKind::Expr(expr) => {
+                let entry_probe =
+                    self.claim_site(ProbeSiteKind::Expression, expr.span, ProbeOutcome::Hit);
+                if let Some(probe) = entry_probe {
+                    self.inject_hit(stmt.span, probe);
+                }
                 if is_require_call(expr) {
                     return self.visit_expr(expr);
                 }
-                if let Some(probe) =
-                    self.claim_site(ProbeSiteKind::Expression, expr.span, ProbeOutcome::Hit)
-                {
-                    self.inject_hit(stmt.span, probe);
-                }
-                self.instrument_value_tree(expr);
+                self.instrument_value_tree_at_entry(expr, entry_probe);
                 return ControlFlow::Continue(());
             }
             ast::StmtKind::Return(value) => {
-                if let Some(probe) =
-                    self.claim_site(ProbeSiteKind::StatementEntry, stmt.span, ProbeOutcome::Hit)
-                {
+                let entry_probe =
+                    self.claim_site(ProbeSiteKind::StatementEntry, stmt.span, ProbeOutcome::Hit);
+                if let Some(probe) = entry_probe {
                     self.inject_hit(stmt.span, probe);
                 }
                 if let Some(value) = value {
-                    self.instrument_value_tree(value);
+                    self.instrument_value_tree_at_entry(value, entry_probe);
                 }
                 return ControlFlow::Continue(());
             }
             ast::StmtKind::DeclSingle(variable) => {
-                if let Some(probe) =
-                    self.claim_site(ProbeSiteKind::StatementEntry, stmt.span, ProbeOutcome::Hit)
-                {
+                let entry_probe =
+                    self.claim_site(ProbeSiteKind::StatementEntry, stmt.span, ProbeOutcome::Hit);
+                if let Some(probe) = entry_probe {
                     self.inject_hit(stmt.span, probe);
                 }
                 if let Some(initializer) = &variable.initializer {
-                    self.instrument_value_tree(initializer);
+                    self.instrument_value_tree_at_entry(initializer, entry_probe);
                 }
                 return ControlFlow::Continue(());
             }
             ast::StmtKind::DeclMulti(_, value) => {
-                if let Some(probe) =
-                    self.claim_site(ProbeSiteKind::StatementEntry, stmt.span, ProbeOutcome::Hit)
-                {
+                let entry_probe =
+                    self.claim_site(ProbeSiteKind::StatementEntry, stmt.span, ProbeOutcome::Hit);
+                if let Some(probe) = entry_probe {
                     self.inject_hit(stmt.span, probe);
                 }
-                self.instrument_value_tree(value);
+                self.instrument_value_tree_at_entry(value, entry_probe);
                 return ControlFlow::Continue(());
             }
             ast::StmtKind::If(cond, then, els_opt) => {
@@ -535,22 +617,24 @@ impl<'ast> Visit<'ast> for Instrumenter<'ast> {
                             probe
                         }
                         ast::StmtKind::DeclSingle(variable) => {
-                            if let Some(initializer) = &variable.initializer {
-                                self.instrument_value_tree(initializer);
-                            }
-                            self.claim_site(
+                            let probe = self.claim_site(
                                 ProbeSiteKind::StatementEntry,
                                 init.span,
                                 ProbeOutcome::Hit,
-                            )
+                            );
+                            if let Some(initializer) = &variable.initializer {
+                                self.instrument_value_tree_at_entry(initializer, probe);
+                            }
+                            probe
                         }
                         ast::StmtKind::DeclMulti(_, value) => {
-                            self.instrument_value_tree(value);
-                            self.claim_site(
+                            let probe = self.claim_site(
                                 ProbeSiteKind::StatementEntry,
                                 init.span,
                                 ProbeOutcome::Hit,
-                            )
+                            );
+                            self.instrument_value_tree_at_entry(value, probe);
+                            probe
                         }
                         _ => None,
                     };
@@ -586,11 +670,12 @@ impl<'ast> Visit<'ast> for Instrumenter<'ast> {
                 return ControlFlow::Continue(());
             }
             ast::StmtKind::Try(ast::StmtTry { expr, clauses }) => {
-                if let Some(probe) =
-                    self.claim_site(ProbeSiteKind::Expression, expr.span, ProbeOutcome::Hit)
-                {
+                let entry_probe =
+                    self.claim_site(ProbeSiteKind::Expression, expr.span, ProbeOutcome::Hit);
+                if let Some(probe) = entry_probe {
                     self.inject_hit(stmt.span, probe);
                 }
+                self.instrument_value_tree_at_entry(expr, entry_probe);
                 let mut path_id = 0;
                 for (index, clause) in clauses.iter().enumerate() {
                     if index != 0 && clause.block.is_empty() {

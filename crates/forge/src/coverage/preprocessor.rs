@@ -12,7 +12,7 @@ use foundry_compilers::{
 use foundry_evm::coverage::{
     CoverageCompleteness, CoverageItem, CoverageItemKind, IncompleteReason, IncompleteReasonKind,
     ProbeId, SourceKey,
-    analysis::{SourceAnalysis, SourceFiles},
+    analysis::{ProbeSite, ProbeSiteKind, SourceAnalysis, SourceFiles},
     probe::MIN_SOLIDITY_VERSION,
 };
 use semver::Version;
@@ -230,13 +230,15 @@ impl Preprocessor<MultiCompiler> for SourceCoveragePreprocessor {
                 Ok((
                     transformed,
                     instrumenter.probes().to_vec(),
-                    instrumenter.unclaimed_site_count(),
+                    instrumenter.unclaimed_sites(),
                     instrumenter.unsupported_constructs,
                 ))
             });
 
             match result {
                 Ok((transformed, probes, unmatched, unsupported_constructs)) => {
+                    let unmatched_detail = (!unmatched.is_empty())
+                        .then(|| describe_unclaimed_sites(&unmatched, original));
                     source.content = Arc::new(transformed);
                     let mut state = self.state.lock().unwrap();
                     for detail in unsupported_constructs {
@@ -246,11 +248,11 @@ impl Preprocessor<MultiCompiler> for SourceCoveragePreprocessor {
                             detail,
                         ));
                     }
-                    if unmatched != 0 {
+                    if let Some(detail) = unmatched_detail {
                         state.completeness.push(IncompleteReason::new(
                             Some(path.clone()),
                             IncompleteReasonKind::InstrumentationBoundary,
-                            format!("{unmatched} canonical coverage item(s) have no safe probe"),
+                            detail,
                         ));
                     }
                     state.sources.push(PreparedSource {
@@ -271,6 +273,64 @@ impl Preprocessor<MultiCompiler> for SourceCoveragePreprocessor {
 
         Ok(())
     }
+}
+
+fn describe_unclaimed_sites(sites: &[ProbeSite], source: &str) -> String {
+    let mut functions = 0;
+    let mut statements = 0;
+    let mut expressions = 0;
+    let mut branches = 0;
+    for site in sites {
+        match site.kind {
+            ProbeSiteKind::FunctionEntry => functions += 1,
+            ProbeSiteKind::StatementEntry => statements += 1,
+            ProbeSiteKind::Expression => expressions += 1,
+            ProbeSiteKind::Branch { .. } => branches += 1,
+        }
+    }
+    let mut kinds = Vec::new();
+    if functions != 0 {
+        kinds.push(format!("{functions} function"));
+    }
+    if statements != 0 {
+        kinds.push(format!("{statements} statement"));
+    }
+    if expressions != 0 {
+        kinds.push(format!("{expressions} expression"));
+    }
+    if branches != 0 {
+        kinds.push(format!("{branches} branch"));
+    }
+    let examples = sites
+        .iter()
+        .take(12)
+        .map(|site| {
+            let kind = match site.kind {
+                ProbeSiteKind::FunctionEntry => "function",
+                ProbeSiteKind::StatementEntry => "statement",
+                ProbeSiteKind::Expression => "expression",
+                ProbeSiteKind::Branch { .. } => "branch",
+            };
+            let snippet = source
+                .get(site.loc.bytes.start as usize..site.loc.bytes.end as usize)
+                .unwrap_or("<invalid span>")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let snippet = if snippet.chars().count() > 120 {
+                format!("{}...", snippet.chars().take(120).collect::<String>())
+            } else {
+                snippet
+            };
+            format!("{}:{} {kind} `{snippet}`", site.loc.contract_name, site.loc.lines.start)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{} canonical coverage item(s) have no safe probe ({}; examples: {examples})",
+        sites.len(),
+        kinds.join(", ")
+    )
 }
 
 fn compilation_fingerprint(input: &foundry_compilers::solc::SolcVersionedInput) -> B256 {

@@ -1,6 +1,6 @@
 use crate::{
     ProbeId, SourceHitMaps,
-    probe::{BRANCH_SELECTOR, HIT_SELECTOR},
+    probe::{BOOL_SELECTOR, BRANCH_SELECTOR, HIT_SELECTOR},
 };
 use alloy_primitives::{Address, B256, Bytes};
 use revm::{
@@ -37,11 +37,13 @@ where
                 self.maps.hit(probe);
                 Bytes::new()
             }
+            DecodedProbeCall::Bool { probe, value } => {
+                self.maps.hit(probe);
+                encoded_bool(value)
+            }
             DecodedProbeCall::Branch { if_true, if_false, value } => {
                 self.maps.hit(if value { if_true } else { if_false });
-                let mut encoded = [0u8; 32];
-                encoded[31] = u8::from(value);
-                Bytes::copy_from_slice(&encoded)
+                encoded_bool(value)
             }
         };
 
@@ -61,6 +63,7 @@ where
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DecodedProbeCall {
     Hit(ProbeId),
+    Bool { probe: ProbeId, value: bool },
     Branch { if_true: ProbeId, if_false: ProbeId, value: bool },
 }
 
@@ -73,18 +76,35 @@ fn decode_probe_call(input: &[u8]) -> Option<DecodedProbeCall> {
         return Some(DecodedProbeCall::Hit(ProbeId::from_digest(B256::from_slice(&input[4..36]))));
     }
 
-    if selector != *BRANCH_SELECTOR || input.len() != 100 {
-        return None;
+    if selector == *BOOL_SELECTOR {
+        if input.len() != 68 {
+            return None;
+        }
+        return Some(DecodedProbeCall::Bool {
+            probe: ProbeId::from_digest(B256::from_slice(&input[4..36])),
+            value: decode_bool_word(&input[36..68])?,
+        });
     }
-    let bool_word = &input[68..100];
-    if bool_word[..31].iter().any(|&byte| byte != 0) || bool_word[31] > 1 {
+
+    if selector != *BRANCH_SELECTOR || input.len() != 100 {
         return None;
     }
     Some(DecodedProbeCall::Branch {
         if_true: ProbeId::from_digest(B256::from_slice(&input[4..36])),
         if_false: ProbeId::from_digest(B256::from_slice(&input[36..68])),
-        value: bool_word[31] == 1,
+        value: decode_bool_word(&input[68..100])?,
     })
+}
+
+fn decode_bool_word(word: &[u8]) -> Option<bool> {
+    (word.len() == 32 && word[..31].iter().all(|&byte| byte == 0) && word[31] <= 1)
+        .then(|| word[31] == 1)
+}
+
+fn encoded_bool(value: bool) -> Bytes {
+    let mut encoded = [0u8; 32];
+    encoded[31] = u8::from(value);
+    Bytes::copy_from_slice(&encoded)
 }
 
 #[cfg(test)]
@@ -92,7 +112,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decodes_exact_hit_and_branch_calls() {
+    fn decodes_exact_hit_bool_and_branch_calls() {
         let true_id = B256::repeat_byte(0x11);
         let false_id = B256::repeat_byte(0x22);
         let mut hit = Vec::from(*HIT_SELECTOR);
@@ -100,6 +120,15 @@ mod tests {
         assert_eq!(
             decode_probe_call(&hit),
             Some(DecodedProbeCall::Hit(ProbeId::from_digest(true_id)))
+        );
+
+        let mut bool_call = Vec::from(*BOOL_SELECTOR);
+        bool_call.extend_from_slice(true_id.as_slice());
+        bool_call.extend_from_slice(&[0u8; 31]);
+        bool_call.push(1);
+        assert_eq!(
+            decode_probe_call(&bool_call),
+            Some(DecodedProbeCall::Bool { probe: ProbeId::from_digest(true_id), value: true })
         );
 
         let mut branch = Vec::from(*BRANCH_SELECTOR);
@@ -126,6 +155,12 @@ mod tests {
         invalid_bool.push(2);
         assert_eq!(decode_probe_call(&invalid_bool), None);
         assert_eq!(decode_probe_call(&invalid_bool[..99]), None);
+
+        let mut invalid_single_bool = Vec::from(*BOOL_SELECTOR);
+        invalid_single_bool.extend_from_slice(B256::ZERO.as_slice());
+        invalid_single_bool.extend_from_slice(&[0u8; 31]);
+        invalid_single_bool.push(2);
+        assert_eq!(decode_probe_call(&invalid_single_bool), None);
         assert_eq!(decode_probe_call(&[]), None);
     }
 }

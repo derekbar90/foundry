@@ -271,7 +271,11 @@ impl CoverageArgs {
         preprocessor: SourceCoveragePreprocessor,
     ) -> Result<(Project, ProjectCompileOutput)> {
         let mut project = config.ephemeral_project()?;
-        if self.ir_minimum || config.via_ir {
+        // Source instrumentation does not consume compiler source maps, so preserve the project's
+        // optimizer and via-IR settings unless the user explicitly requests the minimum-IR
+        // workaround. Changing an already-working via-IR profile can itself trigger Yul stack
+        // allocation failures in stack-dense contracts.
+        if self.ir_minimum {
             config.disable_optimizations(&mut project, true);
         }
         let output = ProjectCompiler::default()

@@ -5,7 +5,7 @@ use foundry_compilers::ProjectCompileOutput;
 use rayon::prelude::*;
 use solar::{
     ast::{self, ExprKind, ItemKind, StmtKind, yul},
-    data_structures::{Never, map::FxHashSet},
+    data_structures::{Never, map::FxHashMap},
     interface::{BytePos, Span},
     sema::{Gcx, hir},
 };
@@ -63,8 +63,8 @@ struct SourceVisitor<'gcx> {
     items: Vec<AnalyzedItem>,
 
     all_lines: Vec<u32>,
-    function_calls: Vec<Span>,
-    function_calls_set: FxHashSet<Span>,
+    function_calls: Vec<(Span, Arc<str>)>,
+    function_calls_by_contract: FxHashMap<Span, Arc<str>>,
 }
 
 struct SourceVisitorCheckpoint {
@@ -82,7 +82,7 @@ impl<'gcx> SourceVisitor<'gcx> {
             branch_id: 0,
             all_lines: Default::default(),
             function_calls: Default::default(),
-            function_calls_set: Default::default(),
+            function_calls_by_contract: Default::default(),
             items: Default::default(),
         }
     }
@@ -139,7 +139,7 @@ impl<'gcx> SourceVisitor<'gcx> {
     }
 
     fn resolve_function_calls(&mut self, hir_source_id: hir::SourceId) {
-        self.function_calls_set = self.function_calls.iter().copied().collect();
+        self.function_calls_by_contract = self.function_calls.iter().cloned().collect();
         let _ = hir::Visit::visit_nested_source(self, hir_source_id);
     }
 
@@ -364,7 +364,7 @@ impl<'ast> ast::Visit<'ast> for SourceVisitor<'_> {
             }
             ExprKind::Call(callee, _args) => {
                 // Resolve later.
-                self.function_calls.push(expr.span);
+                self.function_calls.push((expr.span, self.contract_name.clone()));
 
                 if let ExprKind::Ident(ident) = &callee.kind {
                     // Might be a require call, add branch coverage.
@@ -466,9 +466,10 @@ impl<'gcx> hir::Visit<'gcx> for SourceVisitor<'gcx> {
 
     fn visit_expr(&mut self, expr: &'gcx hir::Expr<'gcx>) -> ControlFlow<Self::BreakValue> {
         if let hir::ExprKind::Call(lhs, ..) = &expr.kind
-            && self.function_calls_set.contains(&expr.span)
+            && let Some(contract_name) = self.function_calls_by_contract.get(&expr.span).cloned()
             && is_regular_call(lhs)
         {
+            self.contract_name = contract_name;
             self.push_expr(expr.span);
         }
         self.walk_expr(expr)

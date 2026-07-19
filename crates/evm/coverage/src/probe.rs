@@ -10,11 +10,17 @@ pub const MIN_SOLIDITY_VERSION: (u64, u64, u64) = (0, 8, 0);
 /// Signature of the statement/function probe primitive.
 pub const HIT_SIGNATURE: &str = "coverageHit(bytes32)";
 
+/// Signature of the value-preserving single-outcome boolean probe primitive.
+pub const BOOL_SIGNATURE: &str = "coverageBool(bytes32,bool)";
+
 /// Signature of the value-preserving branch probe primitive.
 pub const BRANCH_SIGNATURE: &str = "coverageBranch(bytes32,bytes32,bool)";
 
 /// Selector of [`HIT_SIGNATURE`].
 pub static HIT_SELECTOR: LazyLock<[u8; 4]> = LazyLock::new(|| selector(HIT_SIGNATURE));
+
+/// Selector of [`BOOL_SIGNATURE`].
+pub static BOOL_SELECTOR: LazyLock<[u8; 4]> = LazyLock::new(|| selector(BOOL_SIGNATURE));
 
 /// Selector of [`BRANCH_SIGNATURE`].
 pub static BRANCH_SELECTOR: LazyLock<[u8; 4]> = LazyLock::new(|| selector(BRANCH_SIGNATURE));
@@ -136,8 +142,11 @@ mod tests {
     #[test]
     fn selectors_match_the_frozen_protocol() {
         assert_eq!(*HIT_SELECTOR, selector(HIT_SIGNATURE));
+        assert_eq!(*BOOL_SELECTOR, selector(BOOL_SIGNATURE));
         assert_eq!(*BRANCH_SELECTOR, selector(BRANCH_SIGNATURE));
+        assert_ne!(*HIT_SELECTOR, *BOOL_SELECTOR);
         assert_ne!(*HIT_SELECTOR, *BRANCH_SELECTOR);
+        assert_ne!(*BOOL_SELECTOR, *BRANCH_SELECTOR);
     }
 
     #[test]

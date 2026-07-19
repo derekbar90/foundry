@@ -159,6 +159,98 @@ contract ShortCircuitTest is DSTest {
     assert!(side.contains("hits: 0"), "skipped side() was reported covered: {side}");
 });
 
+forgetest!(instrumented_long_short_circuit_chain_avoids_stack_pressure, |prj, cmd| {
+    prj.insert_ds_test();
+    prj.update_config(|config| {
+        config.optimizer = Some(false);
+        config.via_ir = false;
+    });
+    prj.add_source(
+        "ShortCircuitChain.sol",
+        r#"
+contract ShortCircuitChain {
+    uint16 constant DIVISOR = 10_000;
+    uint16 constant MAX_LOSS = 500;
+    uint24 constant MAX_MOVE = 1_000;
+
+    function validate(uint16 input, uint16 loss, uint24 move, address helper) external view {
+        address currentHelper = address(this);
+        if (currentHelper != address(0) && currentHelper != helper) revert();
+        if (currentHelper == address(0) && helper.code.length == 0) revert();
+        if (
+            input == 0 || input > DIVISOR || loss == 0 || loss > MAX_LOSS
+                || move == 0 || move > MAX_MOVE
+        ) revert();
+    }
+}
+"#,
+    );
+    prj.add_source(
+        "ShortCircuitChainTest.sol",
+        r#"
+import "./test.sol";
+import {ShortCircuitChain} from "./ShortCircuitChain.sol";
+contract ShortCircuitChainTest is DSTest {
+    function testValidate() public {
+        ShortCircuitChain target = new ShortCircuitChain();
+        target.validate(1, 1, 1, address(target));
+    }
+}
+"#,
+    );
+
+    cmd.args(["coverage", "--instrument-source"]).assert_success();
+});
+
+forgetest!(instrumented_calls_use_owning_contract_and_entry_probe, |prj, cmd| {
+    prj.insert_ds_test();
+    prj.add_source(
+        "Calls.sol",
+        r#"
+contract Calls {
+    uint256 public calls;
+
+    function value() internal returns (uint256) {
+        calls++;
+        return calls;
+    }
+
+    function pair() internal returns (uint256, uint256) {
+        calls++;
+        return (calls, calls + 1);
+    }
+
+    function run() external returns (uint256) {
+        require(value() > 0);
+        (uint256 left, uint256 right) = pair();
+        value();
+        return value() + left + right;
+    }
+}
+
+// Keeping a second contract after `Calls` regresses call items accidentally inheriting the last
+// contract name encountered in a source file.
+contract LaterContract {}
+"#,
+    );
+    prj.add_source(
+        "CallsTest.sol",
+        r#"
+import "./test.sol";
+import {Calls} from "./Calls.sol";
+contract CallsTest is DSTest {
+    function testCalls() public {
+        Calls target = new Calls();
+        require(target.run() == 9);
+        require(target.calls() == 4);
+    }
+}
+"#,
+    );
+
+    cmd.args(["coverage", "--instrument-source"]).assert_success();
+});
+
 forgetest!(instrumented_void_and_tuple_for_updates_preserve_control_flow, |prj, cmd| {
     prj.insert_ds_test();
     prj.add_source(
